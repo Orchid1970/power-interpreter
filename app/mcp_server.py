@@ -8,14 +8,15 @@ MCP Tools:
 - submit_job: Submit long-running job (async)
 - get_job_status: Check job progress
 - get_job_result: Get completed job output
-- upload_file: Upload a file to sandbox
+- upload_file: Upload a file (base64) to sandbox
+- fetch_file: Download a file from URL to sandbox
 - list_files: List sandbox files
 - load_dataset: Load CSV into PostgreSQL
 - query_dataset: SQL query against datasets
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.0.6 - Fixed internal API base URL
+Version: 1.1.0 - Added upload_file and fetch_file tools
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -33,9 +34,6 @@ mcp = FastMCP(
 )
 
 # Internal API base URL
-# On Railway, the app runs on port 8080. We use 127.0.0.1 (not localhost)
-# because some container environments resolve localhost differently.
-# The API_BASE_URL env var can override this if needed.
 _default_base = "http://127.0.0.1:8080"
 API_BASE = os.getenv("API_BASE_URL", _default_base)
 API_KEY = os.getenv("API_KEY", "")
@@ -47,6 +45,10 @@ logger.info(f"MCP Server: API_KEY={'***configured***' if API_KEY else 'NOT SET'}
 def _headers():
     return {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
+
+# ============================================================
+# CODE EXECUTION TOOLS
+# ============================================================
 
 @mcp.tool()
 async def execute_code(
@@ -170,6 +172,99 @@ async def get_job_result(job_id: str) -> str:
         return f"Error calling get_job_result API: {e}"
 
 
+# ============================================================
+# FILE MANAGEMENT TOOLS
+# ============================================================
+
+@mcp.tool()
+async def upload_file(
+    filename: str,
+    content_base64: str,
+    session_id: str = "default"
+) -> str:
+    """Upload a file to the sandbox using base64-encoded content.
+    
+    Best for small-to-medium files (<10MB). The file will be saved
+    to the sandbox and can be used by execute_code, load_dataset, etc.
+    
+    To upload a CSV for analysis:
+    1. upload_file("data.csv", base64_content)
+    2. load_dataset("data.csv", "my_dataset")
+    3. query_dataset("SELECT * FROM my_dataset LIMIT 10")
+    
+    Args:
+        filename: Name for the file (e.g., 'invoices.csv', 'report.xlsx')
+        content_base64: Base64-encoded file content
+        session_id: Session for file isolation (default: 'default')
+    
+    Returns:
+        Confirmation with file path, size, and preview info
+    """
+    url = f"{API_BASE}/api/files/upload"
+    logger.info(f"upload_file: POST {url} filename={filename}")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                url,
+                headers=_headers(),
+                json={
+                    "filename": filename,
+                    "content_base64": content_base64,
+                    "session_id": session_id
+                }
+            )
+            logger.info(f"upload_file: response status={resp.status_code}")
+            return resp.text
+    except Exception as e:
+        logger.error(f"upload_file: error: {e}", exc_info=True)
+        return f"Error calling upload_file API: {e}"
+
+
+@mcp.tool()
+async def fetch_file(
+    url: str,
+    filename: str,
+    session_id: str = "default"
+) -> str:
+    """Download a file from a URL into the sandbox.
+    
+    Supports any publicly accessible URL: Google Drive sharing links,
+    Dropbox links, S3 pre-signed URLs, direct download links, etc.
+    
+    For Google Drive, use the format:
+    https://drive.google.com/uc?export=download&id=FILE_ID
+    
+    After fetching, use load_dataset to load CSVs into PostgreSQL,
+    or execute_code to process with pandas.
+    
+    Args:
+        url: Public URL to download from
+        filename: What to name the file in the sandbox (e.g., 'invoices.csv')
+        session_id: Session for file isolation (default: 'default')
+    
+    Returns:
+        Confirmation with file path, size, type detection, and preview
+    """
+    api_url = f"{API_BASE}/api/files/fetch"
+    logger.info(f"fetch_file: POST {api_url} url={url[:80]}... filename={filename}")
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                api_url,
+                headers=_headers(),
+                json={
+                    "url": url,
+                    "filename": filename,
+                    "session_id": session_id
+                }
+            )
+            logger.info(f"fetch_file: response status={resp.status_code}")
+            return resp.text
+    except Exception as e:
+        logger.error(f"fetch_file: error: {e}", exc_info=True)
+        return f"Error calling fetch_file API: {e}"
+
+
 @mcp.tool()
 async def list_files(session_id: str = None) -> str:
     """List files in the sandbox.
@@ -195,6 +290,10 @@ async def list_files(session_id: str = None) -> str:
         return f"Error calling list_files API: {e}"
 
 
+# ============================================================
+# DATASET TOOLS
+# ============================================================
+
 @mcp.tool()
 async def load_dataset(
     file_path: str,
@@ -208,7 +307,7 @@ async def load_dataset(
     After loading, use query_dataset with SQL to analyze.
     
     Args:
-        file_path: Path to CSV in sandbox
+        file_path: Path to CSV in sandbox (just the filename if in session root)
         dataset_name: Logical name (e.g., 'vestis_invoices')
         session_id: Optional session
         delimiter: CSV delimiter (default comma)
@@ -298,6 +397,10 @@ async def list_datasets(session_id: str = None) -> str:
         logger.error(f"list_datasets: error: {e}", exc_info=True)
         return f"Error calling list_datasets API: {e}"
 
+
+# ============================================================
+# SESSION TOOLS
+# ============================================================
 
 @mcp.tool()
 async def create_session(
