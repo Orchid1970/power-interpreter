@@ -15,7 +15,9 @@ alembic==1.14.1
 psycopg2-binary==2.9.10
 
 # --- MCP Protocol ---
-mcp==1.2.0
+# Bumped from 1.2.0 to 1.6.0 for sse_app() support
+# sse_app() is required to mount FastMCP inside a FastAPI app
+mcp>=1.6.0
 
 # --- Data Analysis (Pre-installed for sandbox) ---
 pandas==2.2.3
