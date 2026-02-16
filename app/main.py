@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.auth import verify_api_key
 from app.routes import execute, jobs, files, data, sessions, health
+from app.mcp_server import mcp
 
 # Configure logging
 logging.basicConfig(
@@ -71,6 +72,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Max memory: {settings.MAX_MEMORY_MB} MB")
     logger.info(f"  Max concurrent jobs: {settings.MAX_CONCURRENT_JOBS}")
     logger.info(f"  Job timeout: {settings.JOB_TIMEOUT}s")
+    logger.info(f"  MCP server: mounted at /mcp")
     
     yield
     
@@ -159,3 +161,8 @@ app.include_router(
     tags=["Sessions"],
     dependencies=[Depends(verify_api_key)]
 )
+
+# --- MCP SERVER (SimTheory.ai tool discovery & execution) ---
+# Mount the FastMCP server so SimTheory can discover and call all 10 tools
+# This handles the MCP protocol: tool listing, tool execution, streaming
+app.mount("/mcp", mcp.streamable_http_app())
