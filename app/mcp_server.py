@@ -3,7 +3,7 @@
 Defines the MCP tools that SimTheory.ai can call.
 This maps MCP tool calls to the FastAPI endpoints.
 
-MCP Tools:
+MCP Tools (12):
 - execute_code: Run Python code (sync, <60s)
 - submit_job: Submit long-running job (async)
 - get_job_status: Check job progress
@@ -16,7 +16,7 @@ MCP Tools:
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.1.0 - Added upload_file and fetch_file tools
+Version: 1.1.1 - Improved tool descriptions for SimTheory file handling
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -56,7 +56,24 @@ async def execute_code(
     session_id: str = "default",
     timeout: int = 30
 ) -> str:
-    """Execute Python code in a sandboxed environment.
+    """Execute Python code in a remote sandboxed environment on Railway.
+    
+    IMPORTANT: This runs on a REMOTE server, NOT locally. You CANNOT reference
+    local file paths like /home/ubuntu/... or /tmp/uploads/...
+    
+    To work with files:
+    1. First use upload_file (for small files <10MB, base64 encoded)
+    2. Or use fetch_file (for files available at a URL)
+    3. Then reference files by their sandbox path: just the filename like 'data.csv'
+    
+    Example workflow for analyzing a CSV:
+    1. fetch_file(url="https://example.com/data.csv", filename="data.csv")
+    2. execute_code(code="import pandas as pd; df = pd.read_csv('data.csv'); print(df.head())")
+    
+    Or for files already in the sandbox:
+    - execute_code(code="import pandas as pd; df = pd.read_csv('data.csv'); print(df.describe())")
+    
+    The sandbox directory is the working directory. Use relative paths only.
     
     Pre-installed libraries: pandas, numpy, matplotlib, plotly, seaborn,
     scipy, scikit-learn, statsmodels, openpyxl, pdfplumber.
@@ -64,7 +81,7 @@ async def execute_code(
     Use for quick operations (<60s). For longer tasks, use submit_job.
     
     Args:
-        code: Python code to execute
+        code: Python code to execute. Do NOT use absolute file paths.
         session_id: Session ID for file isolation
         timeout: Max seconds (max 60 for sync)
     
@@ -93,7 +110,10 @@ async def submit_job(
     session_id: str = None,
     timeout: int = 600
 ) -> str:
-    """Submit a long-running job for async execution.
+    """Submit a long-running job for async execution on the remote server.
+    
+    IMPORTANT: This runs on a REMOTE server. You CANNOT reference local file paths.
+    Files must be uploaded first using upload_file or fetch_file.
     
     Returns immediately with a job_id. Use get_job_status to check progress.
     Use get_job_result to get output when complete.
@@ -104,7 +124,7 @@ async def submit_job(
     - Report generation
     
     Args:
-        code: Python code to execute
+        code: Python code to execute. Use relative paths for sandbox files.
         session_id: Session ID for file isolation
         timeout: Max seconds (default 600 = 10 min)
     
@@ -182,13 +202,22 @@ async def upload_file(
     content_base64: str,
     session_id: str = "default"
 ) -> str:
-    """Upload a file to the sandbox using base64-encoded content.
+    """Upload a file to the remote sandbox using base64-encoded content.
     
-    Best for small-to-medium files (<10MB). The file will be saved
-    to the sandbox and can be used by execute_code, load_dataset, etc.
+    USE THIS when the user provides or attaches a file in the conversation.
+    This is the PRIMARY way to get files into the sandbox for analysis.
     
-    To upload a CSV for analysis:
-    1. upload_file("data.csv", base64_content)
+    Best for files under 10MB. For larger files, the user should host
+    the file at a URL and use fetch_file instead.
+    
+    After uploading, the file is available in the sandbox by its filename.
+    
+    Complete workflow example:
+    1. upload_file("invoices.csv", "<base64 content>")
+    2. execute_code("import pandas as pd; df = pd.read_csv('invoices.csv'); print(df.head())")
+    
+    Or load into PostgreSQL for SQL queries:
+    1. upload_file("data.csv", "<base64 content>")
     2. load_dataset("data.csv", "my_dataset")
     3. query_dataset("SELECT * FROM my_dataset LIMIT 10")
     
@@ -226,16 +255,21 @@ async def fetch_file(
     filename: str,
     session_id: str = "default"
 ) -> str:
-    """Download a file from a URL into the sandbox.
+    """Download a file from a URL into the remote sandbox.
     
-    Supports any publicly accessible URL: Google Drive sharing links,
-    Dropbox links, S3 pre-signed URLs, direct download links, etc.
+    USE THIS for large files or files hosted online. Supports up to 500MB.
     
-    For Google Drive, use the format:
-    https://drive.google.com/uc?export=download&id=FILE_ID
+    Supports any publicly accessible URL:
+    - Google Drive: https://drive.google.com/uc?export=download&id=FILE_ID
+    - Dropbox: Change dl=0 to dl=1 in the sharing URL
+    - S3 pre-signed URLs
+    - Any direct download link
     
-    After fetching, use load_dataset to load CSVs into PostgreSQL,
-    or execute_code to process with pandas.
+    After fetching, the file is available in the sandbox by its filename.
+    
+    Example workflow:
+    1. fetch_file(url="https://example.com/big_data.csv", filename="data.csv")
+    2. execute_code("import pandas as pd; df = pd.read_csv('data.csv'); print(df.shape)")
     
     Args:
         url: Public URL to download from
@@ -267,7 +301,9 @@ async def fetch_file(
 
 @mcp.tool()
 async def list_files(session_id: str = None) -> str:
-    """List files in the sandbox.
+    """List files in the remote sandbox.
+    
+    Use this to see what files are available before running code.
     
     Args:
         session_id: Optional session filter
@@ -301,14 +337,17 @@ async def load_dataset(
     session_id: str = None,
     delimiter: str = ","
 ) -> str:
-    """Load a CSV file into PostgreSQL for fast SQL querying.
+    """Load a CSV file from the sandbox into PostgreSQL for fast SQL querying.
+    
+    IMPORTANT: The file must already be in the sandbox. Use upload_file or
+    fetch_file first to get the file into the sandbox.
     
     Handles 1.5M+ rows by loading in chunks.
     After loading, use query_dataset with SQL to analyze.
     
     Args:
-        file_path: Path to CSV in sandbox (just the filename if in session root)
-        dataset_name: Logical name (e.g., 'vestis_invoices')
+        file_path: Filename in sandbox (e.g., 'invoices.csv' - NOT a local path)
+        dataset_name: Logical name for SQL queries (e.g., 'vestis_invoices')
         session_id: Optional session
         delimiter: CSV delimiter (default comma)
     
@@ -341,7 +380,7 @@ async def query_dataset(
     limit: int = 1000,
     offset: int = 0
 ) -> str:
-    """Execute a SQL query against loaded datasets.
+    """Execute a SQL query against loaded datasets in PostgreSQL.
     
     Only SELECT queries allowed. Results paginated.
     
@@ -375,7 +414,7 @@ async def list_datasets(session_id: str = None) -> str:
     """List all datasets loaded into PostgreSQL.
     
     Shows dataset names, table names, row counts, and sizes.
-    Use the table_name in SQL queries.
+    Use the table_name in SQL queries with query_dataset.
     
     Args:
         session_id: Optional session filter
@@ -410,6 +449,7 @@ async def create_session(
     """Create a new workspace session for file/data isolation.
     
     Use session_id in other tools to scope operations.
+    Each session has its own sandbox directory and file space.
     
     Args:
         name: Session name (e.g., 'vestis-audit', 'financial-model')
