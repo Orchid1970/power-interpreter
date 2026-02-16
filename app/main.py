@@ -19,7 +19,6 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.routing import Mount
 
 from app.config import settings
 from app.auth import verify_api_key
@@ -105,47 +104,7 @@ async def _periodic_cleanup():
             logger.error(f"Cleanup error: {e}")
 
 
-# ============================================================
-# Build the MCP SSE sub-application (mcp==1.2.0 compatible)
-# ============================================================
-# In mcp==1.2.0, FastMCP.sse_app() is not a method.
-# Instead, we need to use the low-level SSE transport directly.
-# This creates a Starlette ASGI app that handles:
-#   - GET  /sse          -> SSE connection for MCP protocol
-#   - POST /messages     -> Client-to-server MCP messages
-# ============================================================
-
-from mcp.server.sse import SseServerTransport
-from starlette.applications import Starlette
-from starlette.routing import Route
-
-# Create SSE transport
-sse_transport = SseServerTransport("/messages")
-
-
-async def handle_sse(request):
-    """Handle SSE connections from MCP clients (like SimTheory)"""
-    async with sse_transport.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
-        await mcp._mcp_server.run(
-            streams[0], streams[1], mcp._mcp_server.create_initialization_options()
-        )
-
-
-# Build the MCP sub-app with SSE and message routes
-mcp_sse_app = Starlette(
-    debug=False,
-    routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages", app=sse_transport.handle_post_message),
-    ],
-)
-
-
-# ============================================================
 # Create FastAPI app
-# ============================================================
 app = FastAPI(
     title="Power Interpreter MCP",
     description=(
@@ -204,7 +163,7 @@ app.include_router(
 )
 
 # --- MCP SERVER (SimTheory.ai tool discovery & execution) ---
-# Mount the SSE-based MCP server at /mcp
-# SimTheory connects to: GET /mcp/sse (SSE stream)
-# SimTheory sends to:    POST /mcp/messages (MCP protocol messages)
-app.mount("/mcp", mcp_sse_app)
+# Mount the FastMCP SSE app at /mcp for MCP protocol support
+# This provides: tool discovery, tool execution, SSE streaming
+# Requires mcp>=1.6.0 for sse_app() support
+app.mount("/mcp", mcp.sse_app())
