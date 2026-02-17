@@ -16,24 +16,16 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.5.1 - Fix: avoid markdown image/link syntax in content blocks
-                 
-SimTheory's chat renderer intercepts markdown image syntax ![alt](url)
-in MCP content blocks and rewrites the URL to its own domain, breaking
-image display. Download URLs in markdown link syntax get swallowed into
-a decorative widget with no clickable link.
+Version: 1.5.2 - Fix: stop stripping URLs from stdout
 
-FIX: Return all URLs as labeled plain text. The AI agent receives clean
-URLs and can present them however it wants. SimTheory's renderer has no
-markdown syntax to intercept or rewrite.
-
-Content block format:
-  [
-    {"type": "text", "text": "DataFrame output here..."},
-    {"type": "text", "text": "📊 Chart: chart 001\\nView/download image: https://..."},
-    {"type": "text", "text": "📎 report.xlsx (6.0 KB)\\nDownload: https://..."},
-    {"type": "text", "text": "Session: 3 variables persisted. Execution: 98ms."}
-  ]
+HISTORY OF THE BUG:
+  v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
+  v1.5.0: Introduced content blocks. Stripped URLs from stdout, tried to rebuild
+           from inline_images[]/download_urls[] arrays. Those arrays were empty
+           due to parallel execution race in executor.py. URLs LOST.
+  v1.5.1: Switched from markdown to plain text URLs. Still stripped stdout. Still broken.
+  v1.5.2: Stop stripping stdout. Pass URLs through as-is. Belt-and-suspenders:
+           also create extra blocks from JSON arrays if populated.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -69,17 +61,22 @@ def _build_content_blocks(resp_text: str) -> list:
     
     Returns a LIST of content blocks, not a JSON string.
     main.py's tools/call handler will use these directly:
-      isinstance(result, list) → content = result
+      isinstance(result, list) -> content = result
     
-    IMPORTANT: All URLs are returned as labeled plain text, NOT as
-    markdown image syntax or markdown links. This prevents SimTheory's
-    chat renderer from intercepting and rewriting URLs.
+    CRITICAL DESIGN DECISION (v1.5.2):
+    We do NOT strip URLs from stdout. The executor appends download URLs
+    and chart URLs to stdout, and that's the RELIABLE path. We pass
+    stdout through as-is.
+    
+    If the JSON response also has populated inline_images[] or
+    download_urls[] arrays, we create ADDITIONAL blocks for those
+    (belt and suspenders). But we never remove URLs from stdout.
     
     Content blocks:
-    1. Text block with stdout (the main output)
+    1. Text block with stdout (UNMODIFIED - includes any URLs the executor appended)
     2. Error block (if execution failed)
-    3. Separate text block for EACH chart/image (plain text URL)
-    4. Separate text block for download links (plain text URL)
+    3. Additional image blocks (if inline_images[] is populated in JSON)
+    4. Additional download blocks (if download_urls[] is populated in JSON)
     5. Metadata block (execution time, variables)
     """
     try:
@@ -90,24 +87,12 @@ def _build_content_blocks(resp_text: str) -> list:
     blocks = []
     
     # ================================================================
-    # Block 1: Main output (stdout)
-    # Strip any executor-appended URL sections (we handle them separately)
+    # Block 1: Main output (stdout) — PASSED THROUGH UNMODIFIED
+    #
+    # The executor appends download URLs and chart URLs to stdout.
+    # This is the RELIABLE delivery path. Do NOT strip or modify.
     # ================================================================
-    stdout = data.get('stdout', '')
-    
-    # Remove executor-appended sections — use broad matching to be robust
-    # against minor text changes in executor.py
-    for marker in [
-        '\n\nGenerated files ready for download:',
-        '\n\nGenerated charts:',
-        '\nGenerated files ready for download:',
-        '\nGenerated charts:',
-    ]:
-        idx = stdout.find(marker)
-        if idx >= 0:
-            stdout = stdout[:idx]
-    
-    stdout = stdout.strip()
+    stdout = data.get('stdout', '').strip()
     
     if stdout:
         blocks.append({"type": "text", "text": stdout})
@@ -118,46 +103,37 @@ def _build_content_blocks(resp_text: str) -> list:
     if not data.get('success', False):
         error_msg = data.get('error_message', 'Unknown error')
         error_tb = data.get('error_traceback', '')
-        error_text = f"⚠️ Execution Error: {error_msg}"
+        error_text = f"Execution Error: {error_msg}"
         if error_tb:
-            # Trim traceback to last 500 chars for readability
             if len(error_tb) > 500:
                 error_tb = "..." + error_tb[-500:]
             error_text += f"\n\nTraceback:\n{error_tb}"
         blocks.append({"type": "text", "text": error_text})
     
     # ================================================================
-    # Block 3: Inline images — EACH as its own content block
+    # Block 3: Additional image blocks (belt-and-suspenders)
     #
-    # CRITICAL: Do NOT use markdown image syntax ![alt](url)
-    # SimTheory's renderer intercepts that and rewrites the URL
-    # to its own domain, which 404s.
-    #
-    # Instead: plain text with a labeled URL. The AI agent can
-    # present this however it wants in its response.
+    # If inline_images[] is populated in the JSON response, create
+    # extra blocks. These may duplicate what's in stdout — that's OK.
+    # Better to show the URL twice than zero times.
     # ================================================================
     inline_images = data.get('inline_images', [])
     
     for img in inline_images:
         alt = img.get('alt_text', 'Generated chart')
         url = img.get('url', '')
-        filename = img.get('filename', '')
         if url:
             blocks.append({
                 "type": "text",
-                "text": (
-                    f"📊 Chart: {alt}\n"
-                    f"View/download image: {url}"
-                )
+                "text": f"Chart: {alt}\nImage URL: {url}"
             })
-            logger.info(f"Content block: chart '{alt}' -> {url}")
+            logger.info(f"Content block (extra): chart '{alt}' -> {url}")
     
     # ================================================================
-    # Block 4: Download links for non-image files
+    # Block 4: Additional download blocks (belt-and-suspenders)
     #
-    # CRITICAL: Do NOT use markdown link syntax [text](url)
-    # SimTheory's renderer intercepts that and creates a broken
-    # download widget. Use plain text URLs instead.
+    # If download_urls[] is populated, create extra blocks.
+    # Skip images that were already handled above.
     # ================================================================
     download_urls = data.get('download_urls', [])
     image_filenames = {img.get('filename', '') for img in inline_images}
@@ -168,24 +144,19 @@ def _build_content_blocks(resp_text: str) -> list:
         and not d.get('is_image', False)
     ]
     
-    if non_image_downloads:
-        for info in non_image_downloads:
-            filename = info.get('filename', 'file')
-            url = info.get('url', '')
-            size = info.get('size', '')
-            # Each file gets its own block for maximum visibility
+    for info in non_image_downloads:
+        filename = info.get('filename', 'file')
+        url = info.get('url', '')
+        size = info.get('size', '')
+        if url:
             blocks.append({
                 "type": "text",
-                "text": (
-                    f"📎 {filename} ({size})\n"
-                    f"Download: {url}"
-                )
+                "text": f"File: {filename} ({size})\nDownload URL: {url}"
             })
-            logger.info(f"Content block: download '{filename}' ({size}) -> {url}")
+            logger.info(f"Content block (extra): download '{filename}' -> {url}")
     
     # ================================================================
     # Block 5: Metadata (execution info, variables)
-    # Only if there's useful info to report
     # ================================================================
     meta_parts = []
     
@@ -198,11 +169,6 @@ def _build_content_blocks(resp_text: str) -> list:
         var_count = kernel_info.get('variable_count', 0)
         exec_count = kernel_info.get('execution_count', 0)
         meta_parts.append(f"Session: {var_count} variables persisted (call #{exec_count})")
-    
-    files_created = data.get('files_created', [])
-    if files_created and not inline_images and not non_image_downloads:
-        # Only mention files if they weren't already covered above
-        meta_parts.append(f"Files created: {', '.join(files_created)}")
     
     if meta_parts:
         blocks.append({
@@ -248,25 +214,14 @@ async def execute_code(
       Call 2: execute_code("print(df.shape)", session_id="default")  # df still exists!
       Call 3: execute_code("summary = df.describe(); print(summary)", session_id="default")  # works!
     
-    WRONG (breaks persistence):
-      Call 1: execute_code("df = pd.read_csv('data.csv')", session_id="analysis_1")
-      Call 2: execute_code("print(df.shape)", session_id="analysis_2")  # ERROR: df doesn't exist!
-    
     CHARTS AND VISUALIZATIONS:
-    When code calls plt.show(), the chart is automatically captured as a PNG
-    image. The response will include a plain text URL to the chart image.
-    PRESENT THIS URL TO THE USER as a clickable link or render it inline.
-    The URL points directly to the PNG file and can be opened in any browser.
-    
-    Example:
-      execute_code("import matplotlib.pyplot as plt; plt.bar(['A','B','C'], [1,2,3]); plt.show()")
-      → Response includes: 📊 Chart: chart 001
-                           View/download image: https://power-interpreter.../dl/uuid/chart_001.png
-      → Present this URL to the user so they can view the chart!
+    When code calls plt.show() or creates matplotlib figures, charts are
+    automatically captured as PNG images. Download URLs for the chart images
+    will appear in the stdout output. Present these URLs to the user.
     
     GENERATED FILES:
-    When code creates files (xlsx, csv, pdf), download URLs are returned as
-    plain text in the response. Present these URLs to the user as clickable links.
+    When code creates files (xlsx, csv, pdf), download URLs are included
+    in the stdout output. Present these URLs to the user as clickable links.
     
     REMOTE EXECUTION:
     This runs on a REMOTE server, NOT locally. You CANNOT reference
@@ -290,8 +245,7 @@ async def execute_code(
         timeout: Max seconds (max 60 for sync)
     
     Returns:
-        List of content blocks: stdout text, chart image URLs (as plain text),
-        download links (as plain text), and execution metadata.
+        List of content blocks: stdout text (with URLs), and execution metadata.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url}")
@@ -304,7 +258,6 @@ async def execute_code(
             )
             logger.info(f"execute_code: response status={resp.status_code}")
             
-            # Build structured content blocks (not a JSON blob)
             blocks = _build_content_blocks(resp.text)
             logger.info(f"execute_code: returning {len(blocks)} content blocks")
             return blocks
@@ -327,9 +280,6 @@ async def submit_job(
     SESSION PERSISTENCE: Use session_id="default" to share state with
     execute_code calls. Variables created in execute_code will be available
     in the job, and vice versa.
-    
-    CHARTS: Jobs that generate charts will also auto-capture them.
-    Use get_job_result to retrieve chart URLs after completion.
     
     Returns immediately with a job_id. Use get_job_status to check progress.
     Use get_job_result to get output when complete.
@@ -404,7 +354,6 @@ async def get_job_result(job_id: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
-            # Use same content block builder for job results
             blocks = _build_content_blocks(resp.text)
             return blocks
     except Exception as e:
