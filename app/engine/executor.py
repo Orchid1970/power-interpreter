@@ -21,8 +21,9 @@ Generated files (xlsx, png, csv, etc.) are automatically stored in
 Postgres (sandbox_files table) and download URLs are returned so they
 survive Railway container redeployments.
 
-Version: 2.2.0 - Fix: Download URLs now include filename in path
-                 /dl/{file_id}/{filename} for correct browser downloads
+Version: 2.3.0 - Optimization: Skip _build_safe_globals when kernel exists
+                 Uses kernel_manager.get_existing() to check first
+                 Saves ~50ms per call by avoiding pandas/numpy reimport
 """
 
 import asyncio
@@ -819,6 +820,10 @@ class SandboxExecutor:
         Generated files are automatically stored in Postgres and
         download URLs are included in the result.
 
+        OPTIMIZATION (v2.3.0): If a kernel already exists for this
+        session_id, we skip _build_safe_globals() entirely. This saves
+        ~50ms per call by avoiding redundant pandas/numpy imports.
+
         Args:
             code: Python code to execute
             session_id: Session ID for state + file isolation
@@ -839,18 +844,31 @@ class SandboxExecutor:
         session_dir.mkdir(parents=True, exist_ok=True)
 
         # =====================================================================
-        # PERSISTENT KERNEL: get_or_create replaces fresh _build_safe_globals
+        # PERSISTENT KERNEL: Check if kernel exists BEFORE building globals
+        #
+        # Optimization: _build_safe_globals() imports pandas, numpy, etc.
+        # which takes ~50ms. If the kernel already exists, we skip it entirely
+        # and reuse the persisted globals dict.
         #
         # First call for a session: builds fresh globals, stores them
         # Subsequent calls: returns the SAME globals dict (state preserved!)
         # =====================================================================
         try:
-            fresh_globals = self._build_safe_globals(session_dir)
-            sandbox_globals = kernel_manager.get_or_create(
-                session_id=session_id,
-                sandbox_globals=fresh_globals,
-                session_dir=session_dir,
-            )
+            # Try to get existing kernel first (fast path)
+            sandbox_globals = kernel_manager.get_existing(session_id)
+            
+            if sandbox_globals is not None:
+                # Kernel exists! Skip _build_safe_globals entirely
+                logger.info(f"Fast path: reusing existing kernel for session={session_id}")
+            else:
+                # New session - build fresh globals (slow path, ~50ms)
+                logger.info(f"Slow path: building fresh globals for session={session_id}")
+                fresh_globals = self._build_safe_globals(session_dir)
+                sandbox_globals = kernel_manager.get_or_create(
+                    session_id=session_id,
+                    sandbox_globals=fresh_globals,
+                    session_dir=session_dir,
+                )
         except Exception as e:
             logger.error(f"Failed to get/create kernel: {e}", exc_info=True)
             result.success = False
