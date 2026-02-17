@@ -16,29 +16,24 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.5.0 - Return MCP content blocks (not JSON blobs)
+Version: 1.5.1 - Fix: avoid markdown image/link syntax in content blocks
                  
-CRITICAL FIX: Previously, execute_code returned a JSON string containing
-the full ExecutionResult. main.py wrapped this in a single text block:
-  {"type": "text", "text": "{\"success\":true,\"stdout\":\"...![chart](url)...\"}"}
+SimTheory's chat renderer intercepts markdown image syntax ![alt](url)
+in MCP content blocks and rewrites the URL to its own domain, breaking
+image display. Download URLs in markdown link syntax get swallowed into
+a decorative widget with no clickable link.
 
-SimTheory's AI had to mentally parse JSON to find image URLs buried inside.
-Charts and download links were invisible to the user.
+FIX: Return all URLs as labeled plain text. The AI agent receives clean
+URLs and can present them however it wants. SimTheory's renderer has no
+markdown syntax to intercept or rewrite.
 
-NEW APPROACH: execute_code now returns a LIST of MCP content blocks:
+Content block format:
   [
     {"type": "text", "text": "DataFrame output here..."},
-    {"type": "text", "text": "![chart 001](https://...chart_001.png)"},
-    {"type": "text", "text": "📎 Download: team_performance.xlsx (6.0 KB)\nhttps://..."},
+    {"type": "text", "text": "📊 Chart: chart 001\\nView/download image: https://..."},
+    {"type": "text", "text": "📎 report.xlsx (6.0 KB)\\nDownload: https://..."},
     {"type": "text", "text": "Session: 3 variables persisted. Execution: 98ms."}
   ]
-
-main.py's tools/call handler already handles list returns:
-  elif isinstance(result, list):
-      content = result
-
-This means each image URL and download link is a SEPARATE, PROMINENT
-content block that SimTheory's AI can easily surface to the user.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -76,11 +71,16 @@ def _build_content_blocks(resp_text: str) -> list:
     main.py's tools/call handler will use these directly:
       isinstance(result, list) → content = result
     
+    IMPORTANT: All URLs are returned as labeled plain text, NOT as
+    markdown image syntax or markdown links. This prevents SimTheory's
+    chat renderer from intercepting and rewriting URLs.
+    
     Content blocks:
     1. Text block with stdout (the main output)
-    2. Separate text block for EACH inline image (markdown format)
-    3. Separate text block for download links
-    4. Metadata block (execution time, variables, errors)
+    2. Error block (if execution failed)
+    3. Separate text block for EACH chart/image (plain text URL)
+    4. Separate text block for download links (plain text URL)
+    5. Metadata block (execution time, variables)
     """
     try:
         data = json.loads(resp_text)
@@ -91,14 +91,17 @@ def _build_content_blocks(resp_text: str) -> list:
     
     # ================================================================
     # Block 1: Main output (stdout)
-    # Strip any previously appended URL sections from executor
+    # Strip any executor-appended URL sections (we handle them separately)
     # ================================================================
     stdout = data.get('stdout', '')
     
-    # Remove executor-appended sections (we handle them separately)
+    # Remove executor-appended sections — use broad matching to be robust
+    # against minor text changes in executor.py
     for marker in [
         '\n\nGenerated files ready for download:',
         '\n\nGenerated charts:',
+        '\nGenerated files ready for download:',
+        '\nGenerated charts:',
     ]:
         idx = stdout.find(marker)
         if idx >= 0:
@@ -125,23 +128,36 @@ def _build_content_blocks(resp_text: str) -> list:
     
     # ================================================================
     # Block 3: Inline images — EACH as its own content block
-    # This makes them maximally visible to the AI agent
+    #
+    # CRITICAL: Do NOT use markdown image syntax ![alt](url)
+    # SimTheory's renderer intercepts that and rewrites the URL
+    # to its own domain, which 404s.
+    #
+    # Instead: plain text with a labeled URL. The AI agent can
+    # present this however it wants in its response.
     # ================================================================
     inline_images = data.get('inline_images', [])
     
     for img in inline_images:
         alt = img.get('alt_text', 'Generated chart')
         url = img.get('url', '')
+        filename = img.get('filename', '')
         if url:
-            # Each image is its own block so the AI can't miss it
             blocks.append({
                 "type": "text",
-                "text": f"![{alt}]({url})"
+                "text": (
+                    f"📊 Chart: {alt}\n"
+                    f"View/download image: {url}"
+                )
             })
-            logger.info(f"Content block: inline image {alt} -> {url}")
+            logger.info(f"Content block: chart '{alt}' -> {url}")
     
     # ================================================================
     # Block 4: Download links for non-image files
+    #
+    # CRITICAL: Do NOT use markdown link syntax [text](url)
+    # SimTheory's renderer intercepts that and creates a broken
+    # download widget. Use plain text URLs instead.
     # ================================================================
     download_urls = data.get('download_urls', [])
     image_filenames = {img.get('filename', '') for img in inline_images}
@@ -153,20 +169,19 @@ def _build_content_blocks(resp_text: str) -> list:
     ]
     
     if non_image_downloads:
-        download_lines = []
         for info in non_image_downloads:
             filename = info.get('filename', 'file')
             url = info.get('url', '')
             size = info.get('size', '')
-            download_lines.append(f"📎 **{filename}** ({size})")
-            download_lines.append(f"Download: {url}")
-            download_lines.append("")
-        
-        blocks.append({
-            "type": "text",
-            "text": "\n".join(download_lines).strip()
-        })
-        logger.info(f"Content block: {len(non_image_downloads)} download link(s)")
+            # Each file gets its own block for maximum visibility
+            blocks.append({
+                "type": "text",
+                "text": (
+                    f"📎 {filename} ({size})\n"
+                    f"Download: {url}"
+                )
+            })
+            logger.info(f"Content block: download '{filename}' ({size}) -> {url}")
     
     # ================================================================
     # Block 5: Metadata (execution info, variables)
@@ -239,18 +254,19 @@ async def execute_code(
     
     CHARTS AND VISUALIZATIONS:
     When code calls plt.show(), the chart is automatically captured as a PNG
-    image and returned as a separate content block with a markdown image URL.
-    DISPLAY THE IMAGE TO THE USER using the markdown syntax from the output.
-    The image URL is a direct link to the PNG — it will render inline in chat.
+    image. The response will include a plain text URL to the chart image.
+    PRESENT THIS URL TO THE USER as a clickable link or render it inline.
+    The URL points directly to the PNG file and can be opened in any browser.
     
     Example:
       execute_code("import matplotlib.pyplot as plt; plt.bar(['A','B','C'], [1,2,3]); plt.show()")
-      → One of the returned content blocks will be: ![chart 001](https://...chart_001.png)
-      → Copy that markdown and include it in your response to render the chart!
+      → Response includes: 📊 Chart: chart 001
+                           View/download image: https://power-interpreter.../dl/uuid/chart_001.png
+      → Present this URL to the user so they can view the chart!
     
     GENERATED FILES:
     When code creates files (xlsx, csv, pdf), download URLs are returned as
-    separate content blocks. Present these URLs to the user as clickable links.
+    plain text in the response. Present these URLs to the user as clickable links.
     
     REMOTE EXECUTION:
     This runs on a REMOTE server, NOT locally. You CANNOT reference
@@ -274,8 +290,8 @@ async def execute_code(
         timeout: Max seconds (max 60 for sync)
     
     Returns:
-        List of content blocks: stdout text, inline chart images (as markdown),
-        download links, and execution metadata. Each is a separate block.
+        List of content blocks: stdout text, chart image URLs (as plain text),
+        download links (as plain text), and execution metadata.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url}")
@@ -375,13 +391,13 @@ async def get_job_result(job_id: str) -> str:
     """Get the full result of a completed job.
     
     Includes stdout, stderr, result data, files created, execution time.
-    If the job generated charts, inline image URLs will be in the output.
+    If the job generated charts, image URLs will be in the output.
     
     Args:
         job_id: The job ID from submit_job
     
     Returns:
-        Full job result with inline images and download links
+        Full job result with image URLs and download links
     """
     url = f"{API_BASE}/api/jobs/{job_id}/result"
     logger.info(f"get_job_result: GET {url}")
