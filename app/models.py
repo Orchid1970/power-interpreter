@@ -4,6 +4,7 @@ All persistent data models for:
 - Sessions (workspace isolation)
 - Jobs (async execution tracking)
 - Files (uploaded and generated)
+- Sandbox files (binary blobs in Postgres for deploy-safe downloads)
 - Data tables (dynamic CSV/dataset storage)
 - Execution logs (audit trail)
 """
@@ -12,7 +13,8 @@ import uuid
 from datetime import datetime
 from sqlalchemy import (
     Column, String, Text, Integer, BigInteger, Float,
-    Boolean, DateTime, JSON, ForeignKey, Index, Enum as SQLEnum
+    Boolean, DateTime, JSON, ForeignKey, Index, Enum as SQLEnum,
+    LargeBinary
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
@@ -109,7 +111,7 @@ class Job(Base):
 
 
 # ============================================================
-# Files - Upload and Generated File Tracking
+# Files - Upload and Generated File Tracking (metadata only)
 # ============================================================
 
 class File(Base):
@@ -145,6 +147,53 @@ class File(Base):
         Index('idx_files_session', 'session_id'),
         Index('idx_files_type', 'file_type'),
     )
+
+
+# ============================================================
+# Sandbox Files - Binary Blobs in Postgres (deploy-safe)
+#
+# Files created by execute_code are stored here so download
+# URLs survive Railway container redeployments. Each file gets
+# a UUID used in public download URLs: /dl/{file_id}
+#
+# Max recommended blob size: ~50MB (Postgres BYTEA limit is 1GB
+# but large blobs impact query performance). For files >50MB,
+# consider external storage (S3/R2) in a future iteration.
+# ============================================================
+
+class SandboxFile(Base):
+    __tablename__ = "sandbox_files"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(String(255), nullable=False, index=True)  # Matches executor session_id (string, not FK)
+    
+    # File identity
+    filename = Column(String(500), nullable=False)          # e.g. "report.xlsx"
+    mime_type = Column(String(200), default="application/octet-stream")
+    file_size = Column(BigInteger, default=0)               # Bytes
+    checksum = Column(String(64), nullable=True)            # SHA-256 for dedup
+    
+    # Binary content - stored directly in Postgres
+    content = Column(LargeBinary, nullable=False)           # The actual file bytes
+    
+    # Lifecycle
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)            # Optional TTL for cleanup
+    download_count = Column(Integer, default=0)             # Track usage
+    
+    # Indexes for fast lookup
+    __table_args__ = (
+        Index('idx_sandbox_files_session', 'session_id'),
+        Index('idx_sandbox_files_created', 'created_at'),
+        Index('idx_sandbox_files_expires', 'expires_at'),
+        Index('idx_sandbox_files_checksum', 'checksum'),
+    )
+    
+    def __repr__(self):
+        return (
+            f"<SandboxFile {self.id}: {self.filename} "
+            f"({self.file_size} bytes, session={self.session_id})>"
+        )
 
 
 # ============================================================
