@@ -21,7 +21,7 @@ Generated files (xlsx, png, csv, etc.) are automatically stored in
 Postgres (sandbox_files table) and download URLs are returned so they
 survive Railway container redeployments.
 
-Version: 2.1.1 - Fix: os.chdir(session_dir) so pandas writes to sandbox
+Version: 2.1.2 - Fix: handle 'from X.Y import Z' for submodule imports
 """
 
 import asyncio
@@ -348,12 +348,26 @@ class SandboxExecutor:
         return safe_open
 
     def _lazy_import(self, name: str, sandbox_globals: Dict):
-        """Lazily import allowed libraries into sandbox"""
+        """Lazily import allowed libraries into sandbox.
+        
+        Returns True if the module was loaded (or already available).
+        When loading, also imports common submodules so that
+        'from X.Y import Z' can be resolved via attribute access.
+        """
         try:
             if name == 'matplotlib' or name == 'matplotlib.pyplot':
                 import matplotlib
                 matplotlib.use('Agg')  # Non-interactive backend
                 import matplotlib.pyplot as plt
+                import matplotlib.patches
+                import matplotlib.gridspec
+                import matplotlib.ticker
+                import matplotlib.colors
+                import matplotlib.cm
+                try:
+                    import matplotlib.patheffects
+                except ImportError:
+                    pass
                 sandbox_globals['matplotlib'] = matplotlib
                 sandbox_globals['plt'] = plt
                 return True
@@ -387,6 +401,17 @@ class SandboxExecutor:
                 return True
             elif name == 'openpyxl':
                 import openpyxl
+                import openpyxl.styles
+                import openpyxl.utils
+                import openpyxl.chart
+                try:
+                    import openpyxl.worksheet.table
+                except ImportError:
+                    pass
+                try:
+                    import openpyxl.formatting.rule
+                except ImportError:
+                    pass
                 sandbox_globals['openpyxl'] = openpyxl
                 return True
             elif name == 'pdfplumber':
@@ -401,13 +426,77 @@ class SandboxExecutor:
                 import xlsxwriter
                 sandbox_globals['xlsxwriter'] = xlsxwriter
                 return True
+            elif name == 'textwrap':
+                import textwrap
+                sandbox_globals['textwrap'] = textwrap
+                return True
+            elif name == 'string':
+                import string
+                sandbox_globals['string'] = string
+                return True
+            elif name == 'struct':
+                import struct
+                sandbox_globals['struct'] = struct
+                return True
+            elif name == 'decimal':
+                import decimal
+                sandbox_globals['decimal'] = decimal
+                return True
+            elif name == 'fractions':
+                import fractions
+                sandbox_globals['fractions'] = fractions
+                return True
+            elif name == 'random':
+                import random
+                sandbox_globals['random'] = random
+                return True
+            elif name == 'time':
+                import time as time_module
+                sandbox_globals['time'] = time_module
+                return True
+            elif name == 'calendar':
+                import calendar
+                sandbox_globals['calendar'] = calendar
+                return True
+            elif name == 'pprint':
+                import pprint
+                sandbox_globals['pprint'] = pprint
+                return True
+            elif name == 'dataclasses':
+                import dataclasses
+                sandbox_globals['dataclasses'] = dataclasses
+                return True
+            elif name == 'typing':
+                import typing
+                sandbox_globals['typing'] = typing
+                return True
+            elif name == 'pathlib':
+                import pathlib
+                sandbox_globals['pathlib'] = pathlib
+                return True
+            elif name == 'os':
+                # Provide limited os functionality
+                import os as os_module
+                sandbox_globals['os'] = os_module
+                return True
         except ImportError as e:
             logger.warning(f"Failed to import {name}: {e}")
             return False
         return False
 
     def _preprocess_code(self, code: str, sandbox_globals: Dict) -> str:
-        """Preprocess code to handle imports and add safety wrappers"""
+        """Preprocess code to handle imports and add safety wrappers.
+        
+        Key behavior for 'from X.Y import A, B, C':
+        - If base module X is loaded (via _lazy_import), we convert the
+          from-import into direct attribute assignments:
+            A = X.Y.A
+            B = X.Y.B  
+            C = X.Y.C
+        - This works because _lazy_import ensures submodules are imported,
+          so attribute access resolves correctly.
+        - This avoids needing __import__ (which is blocked in sandbox).
+        """
         lines = code.split('\n')
         processed_lines = []
 
@@ -416,30 +505,119 @@ class SandboxExecutor:
 
             # Handle import statements
             if stripped.startswith('import ') or stripped.startswith('from '):
-                # Extract module name
-                if stripped.startswith('import '):
+                
+                # ============================================================
+                # Case 1: 'from X.Y import A, B, C' or 'from X import A, B'
+                # ============================================================
+                if stripped.startswith('from '):
+                    # Parse: from <module_path> import <names>
+                    # e.g. 'from openpyxl.styles import Font, PatternFill, Alignment'
+                    try:
+                        parts = stripped.split(' import ', 1)
+                        if len(parts) == 2:
+                            module_path = parts[0].replace('from ', '').strip()
+                            import_names_str = parts[1].strip()
+                            base_module = module_path.split('.')[0]
+                            
+                            # Try to lazy-load the base module
+                            if base_module not in sandbox_globals:
+                                self._lazy_import(base_module, sandbox_globals)
+                            
+                            if base_module in sandbox_globals:
+                                # Parse the imported names (handle 'A, B, C' and 'A as X')
+                                import_items = [n.strip() for n in import_names_str.split(',')]
+                                assignment_lines = []
+                                
+                                for item in import_items:
+                                    item = item.strip()
+                                    if not item:
+                                        continue
+                                    
+                                    # Handle 'Name as Alias'
+                                    if ' as ' in item:
+                                        original, alias = item.split(' as ', 1)
+                                        original = original.strip()
+                                        alias = alias.strip()
+                                    else:
+                                        original = item
+                                        alias = item
+                                    
+                                    # Build assignment: alias = module_path.original
+                                    # e.g. Font = openpyxl.styles.Font
+                                    assignment_lines.append(
+                                        f"{alias} = {module_path}.{original}"
+                                    )
+                                
+                                if assignment_lines:
+                                    comment = f"# [sandbox] {stripped} -> resolved via attribute access"
+                                    processed_lines.append(comment)
+                                    processed_lines.extend(assignment_lines)
+                                    logger.debug(f"Resolved from-import: {stripped} -> {assignment_lines}")
+                                    continue
+                                else:
+                                    processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
+                                    continue
+                            else:
+                                # Base module not available
+                                processed_lines.append(
+                                    f"# [sandbox] BLOCKED: {stripped} (module {base_module} not in allowed list)"
+                                )
+                                continue
+                        else:
+                            # Malformed from-import, just try the old way
+                            module = stripped.split()[1].split('.')[0]
+                            if self._lazy_import(module, sandbox_globals):
+                                processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
+                                continue
+                            elif module in sandbox_globals:
+                                processed_lines.append(f"# [sandbox] {stripped} -> already available")
+                                continue
+                            else:
+                                processed_lines.append(
+                                    f"# [sandbox] BLOCKED: {stripped} (not in allowed list)"
+                                )
+                                continue
+                    except Exception as e:
+                        logger.warning(f"Failed to parse from-import '{stripped}': {e}")
+                        # Fall through to old handling
+                        module = stripped.split()[1].split('.')[0]
+                        if self._lazy_import(module, sandbox_globals):
+                            processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
+                            continue
+                        elif module in sandbox_globals:
+                            processed_lines.append(f"# [sandbox] {stripped} -> already available")
+                            continue
+                        else:
+                            processed_lines.append(
+                                f"# [sandbox] BLOCKED: {stripped} (not in allowed list)"
+                            )
+                            continue
+                
+                # ============================================================
+                # Case 2: 'import X' or 'import X as Y' or 'import X.Y'
+                # ============================================================
+                else:
+                    # Extract module name
                     module = stripped.split()[1].split('.')[0].split(',')[0]
-                else:
-                    module = stripped.split()[1].split('.')[0]
 
-                # Try to lazy-load it
-                if self._lazy_import(module, sandbox_globals):
-                    # Handle 'from X import Y' and 'import X as Y'
-                    if 'as ' in stripped:
-                        alias = stripped.split(' as ')[-1].strip()
-                        if module in sandbox_globals:
-                            sandbox_globals[alias] = sandbox_globals[module]
-                    processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
-                    continue
-                elif module in sandbox_globals:
-                    processed_lines.append(f"# [sandbox] {stripped} -> already available")
-                    continue
-                else:
-                    # Block unknown imports
-                    processed_lines.append(
-                        f"# [sandbox] BLOCKED: {stripped} (not in allowed list)"
-                    )
-                    continue
+                    # Try to lazy-load it
+                    if self._lazy_import(module, sandbox_globals):
+                        # Handle 'import X as Y'
+                        if ' as ' in stripped:
+                            alias = stripped.split(' as ')[-1].strip()
+                            if module in sandbox_globals:
+                                sandbox_globals[alias] = sandbox_globals[module]
+                        processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
+                        continue
+                    elif module in sandbox_globals:
+                        processed_lines.append(f"# [sandbox] {stripped} -> already available")
+                        continue
+                    else:
+                        # Block unknown imports
+                        processed_lines.append(
+                            f"# [sandbox] BLOCKED: {stripped} (not in allowed list)"
+                        )
+                        continue
 
             processed_lines.append(line)
 
@@ -688,14 +866,15 @@ class SandboxExecutor:
                     # =========================================================
                     # CRITICAL FIX: Change working directory to session sandbox
                     #
-                    # pandas.to_csv(), to_excel(), matplotlib savefig(), etc.
-                    # use Python's built-in open() internally, which resolves
-                    # relative paths against os.getcwd(). Without this chdir,
-                    # files land in /app instead of the session sandbox dir,
-                    # and the file tracker never finds them.
+                    # Libraries like pandas, openpyxl, matplotlib use Python's
+                    # built-in open() internally (not our safe_open override).
+                    # They resolve relative paths against os.getcwd().
                     #
-                    # We restore the original CWD in a finally block to avoid
-                    # side effects on other sessions or the main process.
+                    # Without this, df.to_csv('report.csv') writes to /app/
+                    # instead of /app/sandbox_data/{session_id}/.
+                    #
+                    # The file tracker scans session_dir for new files, so
+                    # files MUST land there for detection + Postgres storage.
                     # =========================================================
                     original_cwd = os.getcwd()
                     try:
@@ -706,6 +885,7 @@ class SandboxExecutor:
                         compiled = compile(processed_code, '<sandbox>', 'exec')
                         exec(compiled, sandbox_globals)
                     finally:
+                        # Always restore original CWD
                         os.chdir(original_cwd)
                         logger.debug(f"Restored CWD to {original_cwd}")
 
@@ -808,9 +988,9 @@ class SandboxExecutor:
 
                 # Also append download URLs to stdout so the AI sees them
                 if download_info:
-                    url_lines = ["\n\n📎 Generated files (download links):"]
+                    url_lines = ["\n\n\U0001f4ce Generated files (download links):"]
                     for info in download_info:
-                        url_lines.append(f"  • {info['filename']} ({info['size']}): {info['url']}")
+                        url_lines.append(f"  \u2022 {info['filename']} ({info['size']}): {info['url']}")
                     url_summary = '\n'.join(url_lines)
                     result.stdout = result.stdout + url_summary
                     logger.info(f"Appended {len(download_info)} download URLs to stdout")
