@@ -9,9 +9,11 @@ Features:
 - Large dataset support (1.5M+ rows via PostgreSQL)
 - File upload/download management
 - Pre-installed data science libraries
+- Persistent session state (kernel architecture)
+- Auto file storage in Postgres with public download URLs
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.0.6
+Version: 1.2.0
 """
 
 import logging
@@ -19,6 +21,7 @@ import asyncio
 import json
 import inspect
 from contextlib import asynccontextmanager
+from datetime import datetime
 from fastapi import FastAPI, Depends, Request
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.auth import verify_api_key
 from app.routes import execute, jobs, files, data, sessions, health
+from app.routes.files import public_router as download_router
 from app.mcp_server import mcp
 
 # Configure logging
@@ -42,7 +46,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.0.6 starting...")
+    logger.info("Power Interpreter MCP v1.2.0 starting...")
     logger.info("="*60)
     
     # Ensure directories exist
@@ -63,14 +67,21 @@ async def lifespan(app: FastAPI):
         logger.warning("No DATABASE_URL configured. Running without database.")
         logger.warning("Set DATABASE_URL to enable: jobs, sessions, datasets, file tracking")
     
-    # Start periodic job cleanup only if DB is available
+    # Start periodic cleanup (jobs + expired sandbox files)
     cleanup_task = None
     if db_ok:
         cleanup_task = asyncio.create_task(_periodic_cleanup())
     
+    # Log public URL for download links
+    public_url = settings.public_base_url
+    
     logger.info("Power Interpreter ready!")
     logger.info(f"  Database: {'connected' if db_ok else 'NOT CONNECTED'}")
     logger.info(f"  Sandbox dir: {settings.SANDBOX_DIR}")
+    logger.info(f"  Public URL: {public_url or '(auto-detect from RAILWAY_PUBLIC_DOMAIN)'}")
+    logger.info(f"  Download endpoint: /dl/{{file_id}} (public, no auth)")
+    logger.info(f"  Sandbox file max: {settings.SANDBOX_FILE_MAX_MB} MB")
+    logger.info(f"  Sandbox file TTL: {settings.SANDBOX_FILE_TTL_HOURS} hours")
     logger.info(f"  Max execution time: {settings.MAX_EXECUTION_TIME}s")
     logger.info(f"  Max memory: {settings.MAX_MEMORY_MB} MB")
     logger.info(f"  Max concurrent jobs: {settings.MAX_CONCURRENT_JOBS}")
@@ -94,18 +105,50 @@ async def lifespan(app: FastAPI):
 
 
 async def _periodic_cleanup():
-    """Periodically clean up old jobs and temp files"""
+    """Periodically clean up old jobs, temp files, and expired sandbox files"""
     while True:
         try:
             await asyncio.sleep(3600)  # Every hour
+            
+            # Clean up old jobs
             from app.engine.job_manager import job_manager
             count = await job_manager.cleanup_old_jobs()
             if count:
                 logger.info(f"Periodic cleanup: removed {count} old jobs")
+            
+            # Clean up expired sandbox files
+            try:
+                await _cleanup_expired_sandbox_files()
+            except Exception as e:
+                logger.error(f"Sandbox file cleanup error: {e}")
+                
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
+
+
+async def _cleanup_expired_sandbox_files():
+    """Delete sandbox files past their TTL from Postgres."""
+    try:
+        from app.database import get_session_factory
+        from app.models import SandboxFile
+        from sqlalchemy import delete
+        
+        factory = get_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                delete(SandboxFile).where(
+                    SandboxFile.expires_at != None,
+                    SandboxFile.expires_at < datetime.utcnow()
+                )
+            )
+            deleted = result.rowcount
+            if deleted:
+                await session.commit()
+                logger.info(f"Cleaned up {deleted} expired sandbox files")
+    except Exception as e:
+        logger.error(f"Failed to clean expired sandbox files: {e}")
 
 
 # Create FastAPI app
@@ -114,9 +157,10 @@ app = FastAPI(
     description=(
         "General-purpose sandboxed Python execution engine. "
         "Execute code, manage files, query large datasets, "
-        "and run long-running analysis jobs without timeouts."
+        "and run long-running analysis jobs without timeouts. "
+        "Generated files get persistent download URLs via /dl/{file_id}."
     ),
-    version="1.0.6",
+    version="1.2.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -296,7 +340,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.0.6",
+                    "version": "1.2.0",
                 },
             },
         }
@@ -377,8 +421,21 @@ async def _handle_single_jsonrpc(data: dict):
     }
 
 
+# =============================================================================
+# ROUTE MOUNTING
+# =============================================================================
+
 # --- PUBLIC ROUTES (no auth) ---
 app.include_router(health.router, tags=["Health"])
+
+# --- PUBLIC DOWNLOAD (no auth) ---
+# Files stored in Postgres via execute_code are served here.
+# URL format: /dl/{file_id} where file_id is a UUID
+app.include_router(
+    download_router,
+    prefix="/dl",
+    tags=["Downloads"],
+)
 
 # --- PROTECTED ROUTES (API key required) ---
 app.include_router(
