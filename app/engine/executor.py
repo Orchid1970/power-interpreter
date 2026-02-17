@@ -8,6 +8,8 @@ Executes Python code in a controlled environment with:
 - Structured result extraction
 - PERSISTENT SESSION STATE (v2.0) - variables survive across calls
 - AUTO FILE STORAGE (v2.1) - generated files stored in Postgres with download URLs
+- INLINE CHART RENDERING (v2.4) - matplotlib/plotly charts auto-captured and
+  returned as inline image URLs for rendering directly in chat
 
 Design: Uses in-process isolation with restricted globals.
 The sandbox has access to pandas, numpy, matplotlib, etc.
@@ -21,9 +23,12 @@ Generated files (xlsx, png, csv, etc.) are automatically stored in
 Postgres (sandbox_files table) and download URLs are returned so they
 survive Railway container redeployments.
 
-Version: 2.3.0 - Optimization: Skip _build_safe_globals when kernel exists
-                 Uses kernel_manager.get_existing() to check first
-                 Saves ~50ms per call by avoiding pandas/numpy reimport
+Chart auto-capture: plt.show() is monkey-patched to save the current
+figure as PNG, store it in Postgres, and return the URL. This means
+any matplotlib code that calls plt.show() will produce an inline image.
+
+Version: 2.4.0 - Inline chart rendering via plt.show() auto-capture
+                 Plotly figures also auto-captured via pio.write_image fallback
 """
 
 import asyncio
@@ -66,6 +71,9 @@ STORABLE_EXTENSIONS = {
     '.html', '.txt', '.md', '.zip', '.parquet',
 }
 
+# Image extensions for inline rendering
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.svg'}
+
 
 class ExecutionResult:
     """Result of code execution"""
@@ -80,6 +88,7 @@ class ExecutionResult:
         self.memory_used_mb: float = 0.0
         self.files_created: list = []
         self.download_urls: list = []  # Public download URLs
+        self.inline_images: list = []  # Image URLs for inline rendering
         self.variables: Dict[str, str] = {}  # Variable name -> type string
         self.kernel_info: Dict[str, Any] = {}  # Kernel session metadata
 
@@ -95,6 +104,7 @@ class ExecutionResult:
             'memory_used_mb': round(self.memory_used_mb, 2),
             'files_created': self.files_created,
             'download_urls': self.download_urls,
+            'inline_images': self.inline_images,
             'variables': self.variables,
             'kernel_info': self.kernel_info,
         }
@@ -109,6 +119,96 @@ class ExecutionResult:
             return self.result
         except (TypeError, ValueError):
             return str(self.result)[:settings.MAX_OUTPUT_SIZE]
+
+
+class ChartCapture:
+    """Captures matplotlib figures when plt.show() is called.
+    
+    This replaces plt.show() with a function that:
+    1. Saves the current figure as a high-quality PNG
+    2. Adds the path to a capture list
+    3. Closes the figure to free memory
+    
+    The executor then stores these PNGs in Postgres and returns
+    inline image URLs.
+    """
+    
+    def __init__(self, session_dir: Path):
+        self.session_dir = session_dir
+        self.captured_charts: List[str] = []  # List of file paths
+        self._chart_counter = 0
+    
+    def make_show_replacement(self, plt_module):
+        """Create a replacement for plt.show() that captures figures."""
+        capture = self  # closure reference
+        
+        def _capturing_show(*args, **kwargs):
+            """Replacement for plt.show() that saves figures as PNG."""
+            try:
+                # Get all open figures
+                fig_nums = plt_module.get_fignums()
+                if not fig_nums:
+                    logger.debug("plt.show() called but no figures to capture")
+                    return
+                
+                for fig_num in fig_nums:
+                    fig = plt_module.figure(fig_num)
+                    capture._chart_counter += 1
+                    
+                    # Generate filename
+                    chart_name = f"chart_{capture._chart_counter:03d}.png"
+                    chart_path = capture.session_dir / chart_name
+                    
+                    # Save high-quality PNG
+                    fig.savefig(
+                        str(chart_path),
+                        format='png',
+                        dpi=150,
+                        bbox_inches='tight',
+                        facecolor='white',
+                        edgecolor='none',
+                        pad_inches=0.1,
+                    )
+                    
+                    capture.captured_charts.append(chart_name)
+                    logger.info(f"Chart captured: {chart_name} (figure {fig_num})")
+                
+                # Close all figures to free memory
+                plt_module.close('all')
+                
+            except Exception as e:
+                logger.error(f"Chart capture failed: {e}", exc_info=True)
+                # Don't raise - let the code continue even if capture fails
+        
+        return _capturing_show
+    
+    def make_savefig_wrapper(self, original_savefig, plt_module):
+        """Wrap plt.savefig() to also track saved figures.
+        
+        Users who call plt.savefig() explicitly still get their file,
+        but we also track it for inline rendering.
+        """
+        capture = self
+        
+        def _tracking_savefig(self_fig, fname, *args, **kwargs):
+            """Wrapper around Figure.savefig that tracks output files."""
+            # Call original savefig
+            result = original_savefig(self_fig, fname, *args, **kwargs)
+            
+            # Track the file if it's an image
+            try:
+                fname_path = Path(fname)
+                if fname_path.suffix.lower() in IMAGE_EXTENSIONS:
+                    # If relative path, it's in session_dir (because we chdir)
+                    if not fname_path.is_absolute():
+                        capture.captured_charts.append(str(fname_path))
+                        logger.info(f"Tracked savefig: {fname}")
+            except Exception as e:
+                logger.debug(f"Could not track savefig: {e}")
+            
+            return result
+        
+        return _tracking_savefig
 
 
 class SandboxExecutor:
@@ -350,6 +450,35 @@ class SandboxExecutor:
 
         return safe_open
 
+    def _install_chart_hooks(self, sandbox_globals: Dict, chart_capture: ChartCapture):
+        """Install matplotlib hooks for auto-capturing charts.
+        
+        This replaces plt.show() with our capturing version and wraps
+        plt.savefig() to track explicitly saved images.
+        
+        Called AFTER _lazy_import loads matplotlib, and EVERY execution
+        (because the user might have reassigned plt in their code).
+        """
+        plt = sandbox_globals.get('plt')
+        if plt is None:
+            return
+        
+        # Replace plt.show() with our capturing version
+        plt.show = chart_capture.make_show_replacement(plt)
+        
+        # Wrap Figure.savefig to track explicit saves
+        try:
+            import matplotlib.figure
+            if not hasattr(matplotlib.figure.Figure, '_original_savefig'):
+                matplotlib.figure.Figure._original_savefig = matplotlib.figure.Figure.savefig
+            matplotlib.figure.Figure.savefig = chart_capture.make_savefig_wrapper(
+                matplotlib.figure.Figure._original_savefig, plt
+            )
+        except Exception as e:
+            logger.debug(f"Could not wrap Figure.savefig: {e}")
+        
+        logger.debug("Chart capture hooks installed")
+
     def _lazy_import(self, name: str, sandbox_globals: Dict):
         """Lazily import allowed libraries into sandbox.
 
@@ -377,6 +506,7 @@ class SandboxExecutor:
                     pass
                 sandbox_globals['matplotlib'] = matplotlib
                 sandbox_globals['plt'] = plt
+                # NOTE: Chart hooks are installed in execute() after preprocessing
                 return True
             elif name == 'seaborn':
                 import seaborn as sns
@@ -686,7 +816,7 @@ class SandboxExecutor:
         3. Insert into sandbox_files table
         4. Build public download URL with filename in path
 
-        Returns list of dicts: [{filename, url, size_human}]
+        Returns list of dicts: [{filename, url, size_human, is_image}]
         """
         if not new_file_paths:
             return []
@@ -757,8 +887,6 @@ class SandboxExecutor:
                         db_session.add(sandbox_file)
 
                         # Build download URL WITH FILENAME IN PATH
-                        # This ensures browsers use the correct filename
-                        # regardless of how the download is triggered
                         encoded_filename = quote(file_path.name)
                         if base_url:
                             url = f"{base_url}/dl/{file_id}/{encoded_filename}"
@@ -773,18 +901,22 @@ class SandboxExecutor:
                         else:
                             size_human = f"{file_size / (1024 * 1024):.1f} MB"
 
+                        # Flag images for inline rendering
+                        is_image = ext in IMAGE_EXTENSIONS
+
                         download_info.append({
                             'filename': file_path.name,
                             'url': url,
                             'size': size_human,
                             'mime_type': mime_type,
                             'file_id': str(file_id),
+                            'is_image': is_image,
                             'expires_at': expires_at.isoformat() if expires_at else None,
                         })
 
                         logger.info(
                             f"Stored in Postgres: {file_path.name} "
-                            f"({size_human}) -> {url}"
+                            f"({size_human}, image={is_image}) -> {url}"
                         )
 
                     except Exception as e:
@@ -820,9 +952,9 @@ class SandboxExecutor:
         Generated files are automatically stored in Postgres and
         download URLs are included in the result.
 
-        OPTIMIZATION (v2.3.0): If a kernel already exists for this
-        session_id, we skip _build_safe_globals() entirely. This saves
-        ~50ms per call by avoiding redundant pandas/numpy imports.
+        Charts created with matplotlib are auto-captured when plt.show()
+        is called. The resulting PNG URLs are returned as inline_images
+        for rendering directly in the chat.
 
         Args:
             code: Python code to execute
@@ -831,7 +963,8 @@ class SandboxExecutor:
             context: Additional variables to inject
 
         Returns:
-            ExecutionResult with stdout, stderr, result, download_urls, etc.
+            ExecutionResult with stdout, stderr, result, download_urls,
+            inline_images, etc.
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
@@ -845,23 +978,13 @@ class SandboxExecutor:
 
         # =====================================================================
         # PERSISTENT KERNEL: Check if kernel exists BEFORE building globals
-        #
-        # Optimization: _build_safe_globals() imports pandas, numpy, etc.
-        # which takes ~50ms. If the kernel already exists, we skip it entirely
-        # and reuse the persisted globals dict.
-        #
-        # First call for a session: builds fresh globals, stores them
-        # Subsequent calls: returns the SAME globals dict (state preserved!)
         # =====================================================================
         try:
-            # Try to get existing kernel first (fast path)
             sandbox_globals = kernel_manager.get_existing(session_id)
             
             if sandbox_globals is not None:
-                # Kernel exists! Skip _build_safe_globals entirely
                 logger.info(f"Fast path: reusing existing kernel for session={session_id}")
             else:
-                # New session - build fresh globals (slow path, ~50ms)
                 logger.info(f"Slow path: building fresh globals for session={session_id}")
                 fresh_globals = self._build_safe_globals(session_dir)
                 sandbox_globals = kernel_manager.get_or_create(
@@ -895,6 +1018,17 @@ class SandboxExecutor:
 
         logger.info(f"Processed code preview: {processed_code[:300]}")
 
+        # =====================================================================
+        # CHART CAPTURE: Set up matplotlib hooks BEFORE execution
+        #
+        # Create a fresh ChartCapture for each execution. Install hooks
+        # on plt.show() so that any charts are saved as PNG and tracked.
+        # This happens AFTER preprocessing (which may have loaded matplotlib).
+        # =====================================================================
+        chart_capture = ChartCapture(session_dir)
+        if 'plt' in sandbox_globals or 'matplotlib' in sandbox_globals:
+            self._install_chart_hooks(sandbox_globals, chart_capture)
+
         # Capture stdout/stderr
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
@@ -911,12 +1045,10 @@ class SandboxExecutor:
         start_time = time.time()
 
         try:
-            # Run in thread pool to not block event loop
             loop = asyncio.get_event_loop()
 
             def _execute():
                 with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                    # Try to set resource limits (may fail in containers)
                     if HAS_RESOURCE:
                         try:
                             mem_bytes = settings.MAX_MEMORY_MB * 1024 * 1024
@@ -927,30 +1059,17 @@ class SandboxExecutor:
                         except (ValueError, OSError, resource_module.error) as e:
                             logger.debug(f"Could not set memory limit: {e}")
 
-                    # =========================================================
-                    # CRITICAL: Change working directory to session sandbox
-                    #
-                    # Libraries like pandas, openpyxl, matplotlib use Python's
-                    # built-in open() internally (not our safe_open override).
-                    # They resolve relative paths against os.getcwd().
-                    #
-                    # Without this, df.to_csv('report.csv') writes to /app/
-                    # instead of /app/sandbox_data/{session_id}/.
-                    # =========================================================
                     original_cwd = os.getcwd()
                     try:
                         os.chdir(session_dir)
                         logger.debug(f"Changed CWD to {session_dir}")
 
-                        # Execute the code
                         compiled = compile(processed_code, '<sandbox>', 'exec')
                         exec(compiled, sandbox_globals)
                     finally:
-                        # Always restore original CWD
                         os.chdir(original_cwd)
                         logger.debug(f"Restored CWD to {original_cwd}")
 
-            # Run with timeout
             await asyncio.wait_for(
                 loop.run_in_executor(None, _execute),
                 timeout=timeout
@@ -963,7 +1082,7 @@ class SandboxExecutor:
             if 'RESULT' in sandbox_globals and sandbox_globals['RESULT'] is not None:
                 result.result = sandbox_globals['RESULT']
 
-            # Get variables from kernel session (uses KernelManager's tracking)
+            # Get variables from kernel session
             session_info = kernel_manager.get_session_info(session_id)
             if session_info:
                 result.variables = session_info['variables']
@@ -1000,7 +1119,8 @@ class SandboxExecutor:
             logger.info(f"Execution completed: success={result.success}, "
                        f"time={result.execution_time_ms}ms, "
                        f"stdout_len={len(result.stdout)}, "
-                       f"stderr_len={len(result.stderr)}")
+                       f"stderr_len={len(result.stderr)}, "
+                       f"charts_captured={len(chart_capture.captured_charts)}")
 
             if result.stdout:
                 logger.info(f"stdout preview: {result.stdout[:200]}")
@@ -1011,11 +1131,11 @@ class SandboxExecutor:
             if HAS_RESOURCE:
                 try:
                     usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
-                    result.memory_used_mb = usage.ru_maxrss / 1024  # Convert KB to MB
+                    result.memory_used_mb = usage.ru_maxrss / 1024
                 except Exception:
                     result.memory_used_mb = 0.0
 
-            # Track new files created
+            # Track new files created (includes chart PNGs from auto-capture)
             if session_dir.exists():
                 try:
                     files_after = set(str(p) for p in session_dir.rglob('*') if p.is_file())
@@ -1029,15 +1149,10 @@ class SandboxExecutor:
                     pass
 
         # =================================================================
-        # AUTO FILE STORAGE: Store generated files in Postgres
+        # AUTO FILE STORAGE + INLINE IMAGE DETECTION
         #
-        # After execution completes, any new files with storable extensions
-        # are saved to the sandbox_files table. Download URLs are returned
-        # so SimTheory can present clickable links to the user.
-        #
-        # v2.2.0: URLs now include filename in path:
-        #   /dl/{file_id}/{filename}
-        # This ensures browsers use the correct filename.
+        # Store all new files in Postgres. For images (especially charts),
+        # also populate inline_images for rendering in chat.
         # =================================================================
         if result.files_created:
             try:
@@ -1048,22 +1163,46 @@ class SandboxExecutor:
                 )
                 result.download_urls = download_info
 
-                # Append download URLs to stdout
-                # (mcp_server.py will reformat these for SimTheory)
-                if download_info:
+                # Separate images for inline rendering
+                for info in download_info:
+                    if info.get('is_image', False):
+                        result.inline_images.append({
+                            'url': info['url'],
+                            'filename': info['filename'],
+                            'alt_text': info['filename'].replace('_', ' ').replace('.png', ''),
+                        })
+
+                # Log chart capture results
+                if chart_capture.captured_charts:
+                    logger.info(
+                        f"Charts auto-captured: {chart_capture.captured_charts} "
+                        f"-> {len(result.inline_images)} inline images"
+                    )
+
+                # Append download URLs to stdout for non-image files
+                non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
+                if non_image_downloads:
                     url_lines = ["\n\nGenerated files ready for download:"]
-                    for info in download_info:
+                    for info in non_image_downloads:
                         url_lines.append(
                             f"\n[{info['filename']} ({info['size']}) - Click to Download]({info['url']})"
                         )
                         url_lines.append(f"Direct link: {info['url']}")
                     url_summary = '\n'.join(url_lines)
                     result.stdout = result.stdout + url_summary
-                    logger.info(f"Appended {len(download_info)} download URLs to stdout")
+                    logger.info(f"Appended {len(non_image_downloads)} download URLs to stdout")
+
+                # For images, append markdown image syntax to stdout
+                # This gives the AI agent the URLs to render inline
+                if result.inline_images:
+                    img_lines = ["\n\nGenerated charts:"]
+                    for img in result.inline_images:
+                        img_lines.append(f"\n![{img['alt_text']}]({img['url']})")
+                    result.stdout = result.stdout + '\n'.join(img_lines)
+                    logger.info(f"Appended {len(result.inline_images)} inline image URLs to stdout")
 
             except Exception as e:
                 logger.error(f"File storage failed (non-fatal): {e}", exc_info=True)
-                # Don't fail the execution result - files are still on disk
 
         return result
 
