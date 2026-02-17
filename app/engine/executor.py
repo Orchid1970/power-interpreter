@@ -21,7 +21,7 @@ Generated files (xlsx, png, csv, etc.) are automatically stored in
 Postgres (sandbox_files table) and download URLs are returned so they
 survive Railway container redeployments.
 
-Version: 2.1.0 - Auto file storage in Postgres with download URLs
+Version: 2.1.1 - Fix: os.chdir(session_dir) so pandas writes to sandbox
 """
 
 import asyncio
@@ -76,7 +76,7 @@ class ExecutionResult:
         self.execution_time_ms: int = 0
         self.memory_used_mb: float = 0.0
         self.files_created: list = []
-        self.download_urls: list = []  # NEW: public download URLs
+        self.download_urls: list = []  # Public download URLs
         self.variables: Dict[str, str] = {}  # Variable name -> type string
         self.kernel_info: Dict[str, Any] = {}  # Kernel session metadata
 
@@ -685,9 +685,29 @@ class SandboxExecutor:
                             # This is expected in many container environments
                             logger.debug(f"Could not set memory limit: {e}")
 
-                    # Execute the code
-                    compiled = compile(processed_code, '<sandbox>', 'exec')
-                    exec(compiled, sandbox_globals)
+                    # =========================================================
+                    # CRITICAL FIX: Change working directory to session sandbox
+                    #
+                    # pandas.to_csv(), to_excel(), matplotlib savefig(), etc.
+                    # use Python's built-in open() internally, which resolves
+                    # relative paths against os.getcwd(). Without this chdir,
+                    # files land in /app instead of the session sandbox dir,
+                    # and the file tracker never finds them.
+                    #
+                    # We restore the original CWD in a finally block to avoid
+                    # side effects on other sessions or the main process.
+                    # =========================================================
+                    original_cwd = os.getcwd()
+                    try:
+                        os.chdir(session_dir)
+                        logger.debug(f"Changed CWD to {session_dir}")
+
+                        # Execute the code
+                        compiled = compile(processed_code, '<sandbox>', 'exec')
+                        exec(compiled, sandbox_globals)
+                    finally:
+                        os.chdir(original_cwd)
+                        logger.debug(f"Restored CWD to {original_cwd}")
 
             # Run with timeout
             await asyncio.wait_for(
@@ -762,6 +782,8 @@ class SandboxExecutor:
                     result.files_created = [
                         str(Path(f).relative_to(session_dir)) for f in new_files
                     ]
+                    if result.files_created:
+                        logger.info(f"New files detected: {result.files_created}")
                 except Exception:
                     pass
 
@@ -786,7 +808,7 @@ class SandboxExecutor:
 
                 # Also append download URLs to stdout so the AI sees them
                 if download_info:
-                    url_lines = ["\n📎 Generated files (download links):"]
+                    url_lines = ["\n\n📎 Generated files (download links):"]
                     for info in download_info:
                         url_lines.append(f"  • {info['filename']} ({info['size']}): {info['url']}")
                     url_summary = '\n'.join(url_lines)
