@@ -3,10 +3,10 @@
 Handles file upload (base64), file fetch (URL), file listing,
 and public download of sandbox-generated files from Postgres.
 
-Version: 1.2.0 - Added /dl/{file_id} public download endpoint
+Version: 1.2.1 - Fix: CORS headers on /dl/{file_id} for cross-origin downloads
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -34,6 +34,18 @@ SANDBOX_DIR = settings.SANDBOX_DIR
 # Max file sizes
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024   # 50MB for base64 uploads
 MAX_FETCH_SIZE = 500 * 1024 * 1024   # 500MB for URL fetches
+
+
+# ============================================================
+# CORS headers for public download endpoint
+# ============================================================
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Type, X-Session-Id",
+    "Access-Control-Max-Age": "3600",
+}
 
 
 # ============================================================
@@ -162,7 +174,85 @@ def get_mime_type(filename: str) -> str:
 # URLs look like: https://your-app.railway.app/dl/{file_id}
 #
 # Mounted separately in main.py so it bypasses auth middleware.
+#
+# CORS: Explicit headers are added to every response so that
+# cross-origin frontends (e.g. SimTheory) can fetch files.
 # ============================================================
+
+@public_router.options("/{file_id}")
+async def download_preflight(file_id: str):
+    """Handle CORS preflight (OPTIONS) for download endpoint.
+    
+    Browsers send an OPTIONS request before cross-origin GET/HEAD.
+    We respond with permissive CORS headers so the actual
+    download request is allowed.
+    """
+    return Response(
+        status_code=204,
+        headers=CORS_HEADERS,
+    )
+
+
+@public_router.head("/{file_id}")
+async def download_head(file_id: str):
+    """Handle HEAD requests for download endpoint.
+    
+    Some clients/browsers send HEAD first to check file size
+    and type before downloading.
+    """
+    # Validate UUID format
+    try:
+        file_uuid = uuid.UUID(file_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid file ID format")
+    
+    try:
+        from app.database import get_session_factory
+        from app.models import SandboxFile
+        from sqlalchemy import select
+        
+        factory = get_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(SandboxFile).where(SandboxFile.id == file_uuid)
+            )
+            sandbox_file = result.scalar_one_or_none()
+            
+            if not sandbox_file:
+                raise HTTPException(status_code=404, detail="File not found or expired")
+            
+            # Check expiry
+            if sandbox_file.expires_at:
+                from datetime import datetime
+                if datetime.utcnow() > sandbox_file.expires_at:
+                    raise HTTPException(status_code=410, detail="File has expired")
+            
+            mime = sandbox_file.mime_type or 'application/octet-stream'
+            if mime.startswith('image/') or mime == 'application/pdf' or mime == 'text/html':
+                disposition = f'inline; filename="{sandbox_file.filename}"'
+            else:
+                disposition = f'attachment; filename="{sandbox_file.filename}"'
+            
+            headers = {
+                "Content-Disposition": disposition,
+                "Content-Length": str(sandbox_file.file_size),
+                "Content-Type": mime,
+                "Cache-Control": "private, max-age=3600",
+                "X-Session-Id": sandbox_file.session_id,
+                **CORS_HEADERS,
+            }
+            
+            return Response(
+                status_code=200,
+                headers=headers,
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"download HEAD error for {file_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve file")
+
 
 @public_router.get("/{file_id}")
 async def download_sandbox_file(file_id: str):
@@ -172,6 +262,8 @@ async def download_sandbox_file(file_id: str):
     work when presented to users by SimTheory.
     
     Files are stored in Postgres and survive container redeployments.
+    
+    CORS headers are included so cross-origin frontends can fetch files.
     """
     # Validate UUID format
     try:
@@ -219,15 +311,19 @@ async def download_sandbox_file(file_id: str):
                 f"downloads={sandbox_file.download_count}"
             )
             
+            # Build response headers with CORS
+            headers = {
+                "Content-Disposition": disposition,
+                "Content-Length": str(sandbox_file.file_size),
+                "Cache-Control": "private, max-age=3600",
+                "X-Session-Id": sandbox_file.session_id,
+                **CORS_HEADERS,
+            }
+            
             return Response(
                 content=sandbox_file.content,
                 media_type=mime,
-                headers={
-                    "Content-Disposition": disposition,
-                    "Content-Length": str(sandbox_file.file_size),
-                    "Cache-Control": "private, max-age=3600",
-                    "X-Session-Id": sandbox_file.session_id,
-                }
+                headers=headers,
             )
     
     except HTTPException:
