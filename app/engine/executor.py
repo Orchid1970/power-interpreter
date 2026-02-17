@@ -7,6 +7,7 @@ Executes Python code in a controlled environment with:
 - Captured stdout/stderr
 - Structured result extraction
 - PERSISTENT SESSION STATE (v2.0) - variables survive across calls
+- AUTO FILE STORAGE (v2.1) - generated files stored in Postgres with download URLs
 
 Design: Uses in-process isolation with restricted globals.
 The sandbox has access to pandas, numpy, matplotlib, etc.
@@ -16,7 +17,11 @@ Session state is managed by KernelManager - globals dicts are persisted
 per session_id and reused across execute() calls, giving notebook-like
 continuity.
 
-Version: 2.0.0 - Persistent kernel architecture
+Generated files (xlsx, png, csv, etc.) are automatically stored in
+Postgres (sandbox_files table) and download URLs are returned so they
+survive Railway container redeployments.
+
+Version: 2.1.0 - Auto file storage in Postgres with download URLs
 """
 
 import asyncio
@@ -28,10 +33,11 @@ import traceback
 import tempfile
 import hashlib
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, Tuple, List
 from contextlib import redirect_stdout, redirect_stderr
 import logging
+import uuid
 
 from app.config import settings
 from app.engine.kernel_manager import kernel_manager
@@ -48,6 +54,16 @@ except ImportError:
     logger.warning("resource module not available - memory limits disabled")
 
 
+# ============================================================
+# File extensions we auto-store in Postgres for download URLs
+# ============================================================
+STORABLE_EXTENSIONS = {
+    '.xlsx', '.xls', '.csv', '.tsv', '.json',
+    '.pdf', '.png', '.jpg', '.jpeg', '.svg',
+    '.html', '.txt', '.md', '.zip', '.parquet',
+}
+
+
 class ExecutionResult:
     """Result of code execution"""
     def __init__(self):
@@ -60,6 +76,7 @@ class ExecutionResult:
         self.execution_time_ms: int = 0
         self.memory_used_mb: float = 0.0
         self.files_created: list = []
+        self.download_urls: list = []  # NEW: public download URLs
         self.variables: Dict[str, str] = {}  # Variable name -> type string
         self.kernel_info: Dict[str, Any] = {}  # Kernel session metadata
 
@@ -74,6 +91,7 @@ class ExecutionResult:
             'execution_time_ms': self.execution_time_ms,
             'memory_used_mb': round(self.memory_used_mb, 2),
             'files_created': self.files_created,
+            'download_urls': self.download_urls,
             'variables': self.variables,
             'kernel_info': self.kernel_info,
         }
@@ -427,6 +445,140 @@ class SandboxExecutor:
 
         return '\n'.join(processed_lines)
 
+    # ================================================================
+    # File Storage: Store generated files in Postgres for download URLs
+    # ================================================================
+
+    async def _store_files_in_postgres(
+        self,
+        new_file_paths: List[str],
+        session_id: str,
+        session_dir: Path,
+    ) -> List[Dict[str, str]]:
+        """Store newly created files in Postgres and return download URL info.
+
+        For each new file:
+        1. Read bytes from disk
+        2. Check size is under SANDBOX_FILE_MAX_MB
+        3. Insert into sandbox_files table
+        4. Build public download URL
+
+        Returns list of dicts: [{filename, url, size_human}]
+        """
+        if not new_file_paths:
+            return []
+
+        download_info = []
+        max_bytes = settings.SANDBOX_FILE_MAX_MB * 1024 * 1024
+        base_url = settings.public_base_url
+        ttl_hours = settings.SANDBOX_FILE_TTL_HOURS
+
+        try:
+            from app.database import get_session_factory
+            from app.models import SandboxFile
+            from app.routes.files import get_mime_type
+
+            factory = get_session_factory()
+            async with factory() as db_session:
+                for rel_path in new_file_paths:
+                    try:
+                        file_path = session_dir / rel_path
+                        if not file_path.exists() or not file_path.is_file():
+                            continue
+
+                        # Check extension
+                        ext = file_path.suffix.lower()
+                        if ext not in STORABLE_EXTENSIONS:
+                            logger.debug(f"Skipping {rel_path}: extension {ext} not storable")
+                            continue
+
+                        # Check size
+                        file_size = file_path.stat().st_size
+                        if file_size > max_bytes:
+                            logger.warning(
+                                f"Skipping {rel_path}: {file_size} bytes exceeds "
+                                f"{settings.SANDBOX_FILE_MAX_MB}MB limit"
+                            )
+                            continue
+
+                        if file_size == 0:
+                            logger.debug(f"Skipping {rel_path}: empty file")
+                            continue
+
+                        # Read file bytes
+                        file_bytes = file_path.read_bytes()
+
+                        # Compute checksum
+                        checksum = hashlib.sha256(file_bytes).hexdigest()
+
+                        # Determine MIME type
+                        mime_type = get_mime_type(file_path.name)
+
+                        # Compute expiry
+                        expires_at = None
+                        if ttl_hours > 0:
+                            expires_at = datetime.utcnow() + timedelta(hours=ttl_hours)
+
+                        # Create SandboxFile record
+                        file_id = uuid.uuid4()
+                        sandbox_file = SandboxFile(
+                            id=file_id,
+                            session_id=session_id,
+                            filename=file_path.name,
+                            mime_type=mime_type,
+                            file_size=file_size,
+                            checksum=checksum,
+                            content=file_bytes,
+                            expires_at=expires_at,
+                        )
+                        db_session.add(sandbox_file)
+
+                        # Build download URL
+                        if base_url:
+                            url = f"{base_url}/dl/{file_id}"
+                        else:
+                            url = f"/dl/{file_id}"
+
+                        # Human-readable size
+                        if file_size < 1024:
+                            size_human = f"{file_size} B"
+                        elif file_size < 1024 * 1024:
+                            size_human = f"{file_size / 1024:.1f} KB"
+                        else:
+                            size_human = f"{file_size / (1024 * 1024):.1f} MB"
+
+                        download_info.append({
+                            'filename': file_path.name,
+                            'url': url,
+                            'size': size_human,
+                            'mime_type': mime_type,
+                            'file_id': str(file_id),
+                            'expires_at': expires_at.isoformat() if expires_at else None,
+                        })
+
+                        logger.info(
+                            f"Stored in Postgres: {file_path.name} "
+                            f"({size_human}) -> {url}"
+                        )
+
+                    except Exception as e:
+                        logger.error(f"Failed to store {rel_path}: {e}")
+                        continue
+
+                # Commit all files at once
+                if download_info:
+                    await db_session.commit()
+                    logger.info(f"Committed {len(download_info)} files to Postgres")
+
+        except Exception as e:
+            logger.error(f"Failed to store files in Postgres: {e}", exc_info=True)
+
+        return download_info
+
+    # ================================================================
+    # Main Execution
+    # ================================================================
+
     async def execute(
         self,
         code: str,
@@ -439,6 +591,9 @@ class SandboxExecutor:
         Variables, dataframes, and imports persist across calls
         within the same session_id. Like a Jupyter notebook.
 
+        Generated files are automatically stored in Postgres and
+        download URLs are included in the result.
+
         Args:
             code: Python code to execute
             session_id: Session ID for state + file isolation
@@ -446,7 +601,7 @@ class SandboxExecutor:
             context: Additional variables to inject
 
         Returns:
-            ExecutionResult with stdout, stderr, result, etc.
+            ExecutionResult with stdout, stderr, result, download_urls, etc.
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
@@ -609,6 +764,38 @@ class SandboxExecutor:
                     ]
                 except Exception:
                     pass
+
+        # =================================================================
+        # AUTO FILE STORAGE: Store generated files in Postgres
+        #
+        # After execution completes, any new files with storable extensions
+        # are saved to the sandbox_files table. Download URLs are returned
+        # so SimTheory can present clickable links to the user.
+        #
+        # This happens OUTSIDE the finally block so execution results
+        # are already captured even if storage fails.
+        # =================================================================
+        if result.files_created:
+            try:
+                download_info = await self._store_files_in_postgres(
+                    new_file_paths=result.files_created,
+                    session_id=session_id,
+                    session_dir=session_dir,
+                )
+                result.download_urls = download_info
+
+                # Also append download URLs to stdout so the AI sees them
+                if download_info:
+                    url_lines = ["\n📎 Generated files (download links):"]
+                    for info in download_info:
+                        url_lines.append(f"  • {info['filename']} ({info['size']}): {info['url']}")
+                    url_summary = '\n'.join(url_lines)
+                    result.stdout = result.stdout + url_summary
+                    logger.info(f"Appended {len(download_info)} download URLs to stdout")
+
+            except Exception as e:
+                logger.error(f"File storage failed (non-fatal): {e}", exc_info=True)
+                # Don't fail the execution result - files are still on disk
 
         return result
 
