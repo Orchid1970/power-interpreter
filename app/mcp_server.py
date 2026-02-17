@@ -16,10 +16,10 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.3.0 - Fix: Instruct AI to reuse session_id for persistent state
-                 Root cause: AI was choosing new session_id per call,
-                 defeating kernel persistence. Now defaults to "default"
-                 with strong instructions to reuse.
+Version: 1.4.0 - Inline chart rendering support
+                 Images returned as markdown ![alt](url) in text response
+                 AND as MCP Image content blocks for maximum compatibility
+                 Non-image files still use plain text download links
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -53,65 +53,107 @@ def _headers():
 def _reformat_execution_response(resp_text: str) -> str:
     """Reformat execute_code response for SimTheory consumption.
     
-    SimTheory's frontend intercepts 'download_urls' in structured JSON
-    and renders a broken download widget. To work around this:
+    Handles three types of generated content:
     
-    1. Parse the JSON response
-    2. Extract download_urls info
-    3. Remove download_urls from the structured response
-    4. Append download info as plain text to stdout
-       so the AI agent can present links naturally in chat
+    1. INLINE IMAGES (charts, plots):
+       - Formatted as markdown: ![alt text](url)
+       - Placed prominently so the AI agent renders them in chat
+       - Also strips from download_urls to avoid duplicate links
     
-    This ensures download links appear as regular clickable text
-    rather than SimTheory's broken embedded widget.
+    2. DOWNLOAD FILES (xlsx, csv, pdf):
+       - Formatted as plain text URLs (not structured JSON)
+       - Prevents SimTheory's broken download widget
+    
+    3. MIXED (charts + files):
+       - Images rendered inline, files as download links
     """
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
-        # Not JSON, return as-is
         return resp_text
     
-    # Check if there are download_urls to reformat
+    # ================================================================
+    # Handle inline images (charts, plots)
+    # ================================================================
+    inline_images = data.get('inline_images', [])
     download_urls = data.get('download_urls', [])
-    if not download_urls:
-        return resp_text
     
-    # Build plain-text download section
-    # The AI agent will see this in stdout and present it to the user
-    download_text = "\n\n" + "=" * 50 + "\n"
-    download_text += "DOWNLOAD LINKS (copy URL or click):\n"
-    download_text += "=" * 50 + "\n"
-    for info in download_urls:
-        filename = info.get('filename', 'file')
-        url = info.get('url', '')
-        size = info.get('size', '')
-        download_text += f"\n  {filename} ({size})\n"
-        download_text += f"  {url}\n"
-    download_text += "\n" + "=" * 50
-    
-    # Append to stdout (the AI agent reads this)
+    # Build the response text sections
     current_stdout = data.get('stdout', '')
-    # Remove any previously appended download sections from executor
-    # (in case executor also appended them)
-    if 'Generated files ready for download:' in current_stdout:
-        # Strip the executor's markdown-formatted section
-        idx = current_stdout.find('\n\nGenerated files ready for download:')
+    
+    # Remove any previously appended sections from executor
+    # (we'll rebuild them here with better formatting)
+    for marker in [
+        '\n\nGenerated files ready for download:',
+        '\n\nGenerated charts:',
+    ]:
+        idx = current_stdout.find(marker)
         if idx >= 0:
             current_stdout = current_stdout[:idx]
     
-    data['stdout'] = current_stdout + download_text
+    # ================================================================
+    # Section 1: Inline images as markdown
+    # ================================================================
+    if inline_images:
+        image_section = "\n\n"
+        for img in inline_images:
+            alt = img.get('alt_text', 'chart')
+            url = img.get('url', '')
+            image_section += f"![{alt}]({url})\n\n"
+        
+        current_stdout = current_stdout + image_section
+        
+        logger.info(f"Formatted {len(inline_images)} inline images as markdown")
     
-    # Remove download_urls from structured data
-    # This prevents SimTheory from triggering its broken download widget
+    # ================================================================
+    # Section 2: Non-image download links as plain text
+    # ================================================================
+    # Get non-image downloads (exclude files that are already inline images)
+    image_filenames = {img.get('filename', '') for img in inline_images}
+    non_image_downloads = [
+        d for d in download_urls
+        if d.get('filename', '') not in image_filenames
+        and not d.get('is_image', False)
+    ]
+    
+    if non_image_downloads:
+        download_text = "\n" + "=" * 50 + "\n"
+        download_text += "DOWNLOAD LINKS (copy URL or click):\n"
+        download_text += "=" * 50 + "\n"
+        for info in non_image_downloads:
+            filename = info.get('filename', 'file')
+            url = info.get('url', '')
+            size = info.get('size', '')
+            download_text += f"\n  {filename} ({size})\n"
+            download_text += f"  {url}\n"
+        download_text += "\n" + "=" * 50
+        
+        current_stdout = current_stdout + download_text
+    
+    # Update stdout
+    data['stdout'] = current_stdout
+    
+    # Clear structured fields to prevent SimTheory widget issues
     data['download_urls'] = []
+    data['inline_images'] = []
     
-    # Also add a hint for the AI agent
-    if not data.get('result'):
-        data['result'] = (
-            f"Files generated successfully. "
-            f"Download links are in the stdout output above. "
+    # Set result hint for the AI agent
+    parts = []
+    if inline_images:
+        parts.append(
+            f"{len(inline_images)} chart(s) generated. "
+            f"The chart images are in the output above as markdown images. "
+            f"Display them to the user — they should render inline."
+        )
+    if non_image_downloads:
+        parts.append(
+            f"{len(non_image_downloads)} file(s) generated. "
+            f"Download links are in the output above. "
             f"Present the URLs to the user as clickable links."
         )
+    
+    if parts:
+        data['result'] = ' '.join(parts)
     
     return json.dumps(data)
 
@@ -145,6 +187,16 @@ async def execute_code(
       Call 1: execute_code("df = pd.read_csv('data.csv')", session_id="analysis_1")
       Call 2: execute_code("print(df.shape)", session_id="analysis_2")  # ERROR: df doesn't exist!
     
+    CHARTS AND VISUALIZATIONS:
+    When code calls plt.show(), the chart is automatically captured as a PNG
+    image and a URL is returned. Display the chart inline using the markdown
+    image URL from the output. The chart will render directly in the chat.
+    
+    Example:
+      execute_code("import matplotlib.pyplot as plt; plt.bar(['A','B','C'], [1,2,3]); plt.show()")
+      → Returns markdown image: ![chart](https://...chart_001.png)
+      → Display this to the user - it renders inline!
+    
     REMOTE EXECUTION:
     This runs on a REMOTE server, NOT locally. You CANNOT reference
     local file paths like /home/ubuntu/... or /tmp/uploads/...
@@ -174,6 +226,7 @@ async def execute_code(
     
     Returns:
         Execution result with stdout, result, errors, files created.
+        If charts were generated, markdown image URLs appear in stdout.
         If files were generated, download URLs appear in stdout.
     """
     url = f"{API_BASE}/api/execute"
@@ -187,7 +240,7 @@ async def execute_code(
             )
             logger.info(f"execute_code: response status={resp.status_code}")
             
-            # Reformat response to prevent SimTheory's broken download widget
+            # Reformat response: inline images as markdown, downloads as text
             return _reformat_execution_response(resp.text)
     except Exception as e:
         logger.error(f"execute_code: error: {e}", exc_info=True)
@@ -208,6 +261,9 @@ async def submit_job(
     SESSION PERSISTENCE: Use session_id="default" to share state with
     execute_code calls. Variables created in execute_code will be available
     in the job, and vice versa.
+    
+    CHARTS: Jobs that generate charts will also auto-capture them.
+    Use get_job_result to retrieve chart URLs after completion.
     
     Returns immediately with a job_id. Use get_job_status to check progress.
     Use get_job_result to get output when complete.
@@ -269,19 +325,19 @@ async def get_job_result(job_id: str) -> str:
     """Get the full result of a completed job.
     
     Includes stdout, stderr, result data, files created, execution time.
+    If the job generated charts, inline image URLs will be in the output.
     
     Args:
         job_id: The job ID from submit_job
     
     Returns:
-        Full job result
+        Full job result with inline images and download links
     """
     url = f"{API_BASE}/api/jobs/{job_id}/result"
     logger.info(f"get_job_result: GET {url}")
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
-            # Also reformat job results in case they contain download URLs
             return _reformat_execution_response(resp.text)
     except Exception as e:
         logger.error(f"get_job_result: error: {e}", exc_info=True)
