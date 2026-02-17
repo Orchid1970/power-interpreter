@@ -21,7 +21,8 @@ Generated files (xlsx, png, csv, etc.) are automatically stored in
 Postgres (sandbox_files table) and download URLs are returned so they
 survive Railway container redeployments.
 
-Version: 2.1.3 - Fix: format download URLs as markdown links for SimTheory
+Version: 2.2.0 - Fix: Download URLs now include filename in path
+                 /dl/{file_id}/{filename} for correct browser downloads
 """
 
 import asyncio
@@ -38,6 +39,7 @@ from typing import Dict, Any, Optional, Tuple, List
 from contextlib import redirect_stdout, redirect_stderr
 import logging
 import uuid
+from urllib.parse import quote
 
 from app.config import settings
 from app.engine.kernel_manager import kernel_manager
@@ -495,6 +497,23 @@ class SandboxExecutor:
                 import os as os_module
                 sandbox_globals['os'] = os_module
                 return True
+            elif name == 'urllib':
+                # Allow urllib for HTTP operations within sandbox
+                import urllib
+                import urllib.request
+                import urllib.parse
+                import urllib.error
+                sandbox_globals['urllib'] = urllib
+                return True
+            elif name == 'requests':
+                # Allow requests if installed
+                try:
+                    import requests as requests_module
+                    sandbox_globals['requests'] = requests_module
+                    return True
+                except ImportError:
+                    logger.warning("requests not installed")
+                    return False
         except ImportError as e:
             logger.warning(f"Failed to import {name}: {e}")
             return False
@@ -664,7 +683,7 @@ class SandboxExecutor:
         1. Read bytes from disk
         2. Check size is under SANDBOX_FILE_MAX_MB
         3. Insert into sandbox_files table
-        4. Build public download URL
+        4. Build public download URL with filename in path
 
         Returns list of dicts: [{filename, url, size_human}]
         """
@@ -736,11 +755,14 @@ class SandboxExecutor:
                         )
                         db_session.add(sandbox_file)
 
-                        # Build download URL
+                        # Build download URL WITH FILENAME IN PATH
+                        # This ensures browsers use the correct filename
+                        # regardless of how the download is triggered
+                        encoded_filename = quote(file_path.name)
                         if base_url:
-                            url = f"{base_url}/dl/{file_id}"
+                            url = f"{base_url}/dl/{file_id}/{encoded_filename}"
                         else:
-                            url = f"/dl/{file_id}"
+                            url = f"/dl/{file_id}/{encoded_filename}"
 
                         # Human-readable size
                         if file_size < 1024:
@@ -995,8 +1017,9 @@ class SandboxExecutor:
         # are saved to the sandbox_files table. Download URLs are returned
         # so SimTheory can present clickable links to the user.
         #
-        # v2.1.3: Format as markdown links so SimTheory renders them as
-        # clickable links instead of broken embedded download widgets.
+        # v2.2.0: URLs now include filename in path:
+        #   /dl/{file_id}/{filename}
+        # This ensures browsers use the correct filename.
         # =================================================================
         if result.files_created:
             try:
@@ -1007,20 +1030,18 @@ class SandboxExecutor:
                 )
                 result.download_urls = download_info
 
-                # Append download URLs to stdout as MARKDOWN LINKS
-                # so SimTheory renders them as clickable links.
+                # Append download URLs to stdout
+                # (mcp_server.py will reformat these for SimTheory)
                 if download_info:
                     url_lines = ["\n\nGenerated files ready for download:"]
                     for info in download_info:
-                        # Markdown link format: [text](url)
                         url_lines.append(
                             f"\n[{info['filename']} ({info['size']}) - Click to Download]({info['url']})"
                         )
-                        # Also include raw URL as fallback
                         url_lines.append(f"Direct link: {info['url']}")
                     url_summary = '\n'.join(url_lines)
                     result.stdout = result.stdout + url_summary
-                    logger.info(f"Appended {len(download_info)} download URLs to stdout (markdown format)")
+                    logger.info(f"Appended {len(download_info)} download URLs to stdout")
 
             except Exception as e:
                 logger.error(f"File storage failed (non-fatal): {e}", exc_info=True)
