@@ -21,7 +21,7 @@ Generated files (xlsx, png, csv, etc.) are automatically stored in
 Postgres (sandbox_files table) and download URLs are returned so they
 survive Railway container redeployments.
 
-Version: 2.1.2 - Fix: handle 'from X.Y import Z' for submodule imports
+Version: 2.1.3 - Fix: format download URLs as markdown links for SimTheory
 """
 
 import asyncio
@@ -994,6 +994,9 @@ class SandboxExecutor:
         # After execution completes, any new files with storable extensions
         # are saved to the sandbox_files table. Download URLs are returned
         # so SimTheory can present clickable links to the user.
+        #
+        # v2.1.3: Format as markdown links so SimTheory renders them as
+        # clickable links instead of broken embedded download widgets.
         # =================================================================
         if result.files_created:
             try:
@@ -1004,14 +1007,20 @@ class SandboxExecutor:
                 )
                 result.download_urls = download_info
 
-                # Also append download URLs to stdout so the AI sees them
+                # Append download URLs to stdout as MARKDOWN LINKS
+                # so SimTheory renders them as clickable links.
                 if download_info:
-                    url_lines = ["\n\n\U0001f4ce Generated files (download links):"]
+                    url_lines = ["\n\nGenerated files ready for download:"]
                     for info in download_info:
-                        url_lines.append(f"  \u2022 {info['filename']} ({info['size']}): {info['url']}")
+                        # Markdown link format: [text](url)
+                        url_lines.append(
+                            f"\n[{info['filename']} ({info['size']}) - Click to Download]({info['url']})"
+                        )
+                        # Also include raw URL as fallback
+                        url_lines.append(f"Direct link: {info['url']}")
                     url_summary = '\n'.join(url_lines)
                     result.stdout = result.stdout + url_summary
-                    logger.info(f"Appended {len(download_info)} download URLs to stdout")
+                    logger.info(f"Appended {len(download_info)} download URLs to stdout (markdown format)")
 
             except Exception as e:
                 logger.error(f"File storage failed (non-fatal): {e}", exc_info=True)
