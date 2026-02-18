@@ -20,7 +20,13 @@ CRITICAL BUG FIX (v2.6):
   alias already exists in sandbox_globals (lazy_import set it correctly).
   Same fix applies to plotly.graph_objects as go, scipy.stats, etc.
 
-Version: 2.6.0 - Fix import alias override bug + robust chart capture
+v2.7.0 - Add reportlab + matplotlib PDF backend to sandbox allowlist
+  PDF generation was blocked because:
+  1. reportlab was not installed AND not in _lazy_import allowlist
+  2. matplotlib.backends.backend_pdf was not imported (only backend_agg)
+  Both paths now work.
+
+Version: 2.7.0
 """
 
 import asyncio
@@ -501,6 +507,9 @@ class SandboxExecutor:
         When loading, also imports common submodules AND sets the
         correct aliases (plt, go, px, sns, sm, etc.) so that the
         preprocessor doesn't need to override them.
+        
+        THIS IS THE ALLOWLIST. If a module doesn't have an elif block
+        here, it will be blocked by _preprocess_code.
         """
         try:
             if name == 'matplotlib' or name == 'matplotlib.pyplot':
@@ -524,9 +533,14 @@ class SandboxExecutor:
                     import matplotlib.backends.backend_agg
                 except ImportError:
                     pass
+                # v2.7.0: Add PDF backend so PdfPages works
+                try:
+                    import matplotlib.backends.backend_pdf
+                except ImportError:
+                    pass
                 sandbox_globals['matplotlib'] = matplotlib
                 sandbox_globals['plt'] = plt
-                logger.info("Loaded matplotlib + pyplot (plt)")
+                logger.info("Loaded matplotlib + pyplot (plt) + backend_pdf")
                 return True
             elif name == 'seaborn':
                 import seaborn as sns
@@ -595,6 +609,35 @@ class SandboxExecutor:
             elif name == 'pdfplumber':
                 import pdfplumber
                 sandbox_globals['pdfplumber'] = pdfplumber
+                return True
+            # ============================================================
+            # v2.7.0: reportlab — professional PDF generation
+            # ============================================================
+            elif name == 'reportlab':
+                import reportlab
+                # Pre-import commonly used submodules so attribute access works
+                import reportlab.lib
+                import reportlab.lib.pagesizes
+                import reportlab.lib.styles
+                import reportlab.lib.units
+                import reportlab.lib.colors
+                import reportlab.lib.enums
+                try:
+                    import reportlab.platypus
+                    import reportlab.platypus.doctemplate
+                    import reportlab.platypus.tables
+                    import reportlab.platypus.paragraph
+                    import reportlab.platypus.spacer
+                    import reportlab.platypus.flowables
+                except ImportError:
+                    pass
+                try:
+                    import reportlab.pdfgen
+                    import reportlab.pdfgen.canvas
+                except ImportError:
+                    pass
+                sandbox_globals['reportlab'] = reportlab
+                logger.info("Loaded reportlab (PDF generation)")
                 return True
             elif name == 'tabulate':
                 from tabulate import tabulate
