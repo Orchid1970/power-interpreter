@@ -13,7 +13,7 @@ Features:
 - Auto file storage in Postgres with public download URLs
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.2.0
+Version: 1.2.1
 """
 
 import logging
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.2.0 starting...")
+    logger.info("Power Interpreter MCP v1.2.1 starting...")
     logger.info("="*60)
     
     # Ensure directories exist
@@ -160,7 +160,7 @@ app = FastAPI(
         "and run long-running analysis jobs without timeouts. "
         "Generated files get persistent download URLs via /dl/{file_id}."
     ),
-    version="1.2.0",
+    version="1.2.1",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -273,6 +273,31 @@ def _get_tools_list() -> list:
     return result
 
 
+def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
+    """
+    Validate that all required arguments are present before calling a tool.
+    Returns an error message string if validation fails, None if OK.
+    """
+    try:
+        sig = inspect.signature(fn)
+        missing = []
+        for param_name, param in sig.parameters.items():
+            if param_name in ('self', 'cls'):
+                continue
+            # If no default value, it's required
+            if param.default is inspect.Parameter.empty:
+                if param_name not in tool_args:
+                    missing.append(param_name)
+        if missing:
+            return (
+                f"Missing required parameter(s) for '{tool_name}': {', '.join(missing)}. "
+                f"Please provide: {', '.join(missing)}"
+            )
+    except Exception:
+        pass  # If we can't inspect, let it through and fail naturally
+    return None
+
+
 @app.post("/mcp/sse")
 async def handle_mcp_jsonrpc(request: Request):
     """
@@ -340,7 +365,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.2.0",
+                    "version": "1.2.1",
                 },
             },
         }
@@ -379,6 +404,23 @@ async def _handle_single_jsonrpc(data: dict):
         try:
             tool = registry[tool_name]
             fn = tool.fn if hasattr(tool, 'fn') else tool
+
+            # ============================================================
+            # FIX: Validate required arguments BEFORE calling the function
+            # Prevents TypeError crashes when SimTheory sends empty args
+            # ============================================================
+            validation_error = _validate_tool_args(fn, tool_args, tool_name)
+            if validation_error:
+                logger.warning(f"MCP direct: {tool_name} argument validation failed: {validation_error}")
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": f"Error: {validation_error}"}],
+                        "isError": True,
+                    },
+                }
+
             logger.info(f"MCP direct: invoking {tool_name}...")
             result = await fn(**tool_args)
             result_str = str(result)
