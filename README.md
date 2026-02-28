@@ -8,7 +8,7 @@ Built for [SimTheory.ai](https://simtheory.ai) — execute Python code, load dat
 
 ## Version
 
-**v1.8.2** — Universal data loading + updated MCP tool descriptions
+**v2.8.4** — Unified version: datetime convenience aliases, universal data loading, updated MCP tool descriptions
 
 ---
 
@@ -97,6 +97,49 @@ All formats are loaded into PostgreSQL in 50K-row chunks with automatic indexing
 
 ---
 
+## Sandbox Features
+
+### Pre-loaded Globals (available without imports)
+| Name | Type | Since |
+|------|------|-------|
+| `pd`, `pandas` | pandas module | v1.0 |
+| `np`, `numpy` | numpy module | v1.0 |
+| `datetime` | datetime module | v1.0 |
+| `timedelta` | datetime.timedelta | **v2.8.4** |
+| `timezone` | datetime.timezone | **v2.8.4** |
+| `date` | datetime.date | **v2.8.4** |
+| `json`, `csv`, `math`, `re`, `io`, `copy` | stdlib modules | v1.0 |
+| `collections`, `itertools`, `functools` | stdlib modules | v1.0 |
+| `statistics`, `hashlib`, `base64` | stdlib modules | v1.0 |
+| `Decimal`, `Fraction`, `Path` | stdlib classes | v1.0 |
+
+### Lazy-loaded Libraries (loaded on first `import`)
+| Library | Aliases Set | Notes |
+|---------|------------|-------|
+| matplotlib | `plt` | Agg backend auto-configured, PDF backend included |
+| seaborn | `sns` | |
+| plotly | `px`, `go` | express + graph_objects |
+| scipy | | stats, optimize, interpolate sub-modules |
+| sklearn | | scikit-learn |
+| statsmodels | `sm` | |
+| openpyxl | | styles, utils, chart, formatting sub-modules |
+| xlsxwriter | | |
+| pdfplumber | | |
+| reportlab | | platypus, pdfgen sub-modules (v2.7.0) |
+| requests | | HTTP client |
+| tabulate, textwrap, string, struct | | |
+| decimal, fractions, random, time, calendar | | |
+| pprint, dataclasses, typing, pathlib, os | | |
+| urllib, shutil, glob | | |
+
+### Path Safety (v2.8.0–v2.8.3)
+- **Session prefix stripping**: `default/file.csv` → `file.csv` when cwd is already `/sandbox/sessions/default/`
+- **/tmp/ interception**: `/tmp/output.csv` → `output.csv` in sandbox
+- **Read-only upload access**: Files at `/home/ubuntu/uploads/` readable but not writable
+- **Sandbox path recognition**: `/app/sandbox_data/` paths passed through unchanged
+
+---
+
 ## API Endpoints
 
 ### Public (no auth)
@@ -159,34 +202,20 @@ Deployed on **Railway** with:
 
 ---
 
-## Pre-installed Libraries
-
-The sandbox kernel includes:
-- **Data**: pandas, numpy, openpyxl, xlsxwriter
-- **Visualization**: matplotlib, seaborn, plotly
-- **Statistics**: scipy, statsmodels, scikit-learn
-- **Math**: sympy
-- **PDF**: pdfplumber
-- **Web**: requests, beautifulsoup4, httpx
-- **Images**: Pillow (PIL)
-- **Standard**: json, csv, re, datetime, collections, math, statistics
-
----
-
 ## Project Structure
 
 ```
 power-interpreter/
 ├── app/
-│   ├── main.py              # FastAPI app, lifespan, MCP JSON-RPC handler
-│   ├── mcp_server.py         # MCP tool definitions (12 tools)
+│   ├── main.py              # FastAPI app, lifespan, MCP JSON-RPC handler (v2.8.4)
+│   ├── mcp_server.py         # MCP tool definitions — 12 tools (v1.8.2)
 │   ├── config.py              # Settings and environment config
 │   ├── auth.py                # API key authentication
 │   ├── database.py            # PostgreSQL connection management
 │   ├── models.py              # SQLAlchemy models (Dataset, SandboxFile, etc.)
 │   ├── engine/
 │   │   ├── data_manager.py    # ★ Universal data loading (CSV/Excel/PDF/JSON/Parquet)
-│   │   ├── executor.py        # Python code execution engine
+│   │   ├── executor.py        # ★ Sandboxed Python execution (v2.8.4)
 │   │   ├── file_manager.py    # Sandbox file management
 │   │   ├── job_manager.py     # Async job queue
 │   │   └── kernel_manager.py  # Persistent Python kernel sessions
@@ -206,24 +235,48 @@ power-interpreter/
 
 ## Version History
 
-| Version | Date | Changes |
-|---------|------|---------|
-| **v1.8.2** | 2026-02-23 | `load_dataset` tool description updated for universal format support |
-| **v1.8.1** | 2026-02-23 | Chart base64 enrichment fix (stdout regex fallback) |
-| **v1.8.0** | 2026-02-22 | Base64 ImageContent blocks for charts |
-| **v1.7.2** | 2026-02-22 | `fetch_from_url` route fix (404 → correct path) |
-| **v1.7.1** | 2026-02-22 | FastMCP constructor fix (removed unsupported kwarg) |
-| **v1.7.0** | 2026-02-21 | `fetch_from_url` tool added (CDN/S3/URL direct download) |
-| **v1.6.0** | 2026-02-20 | Auto file handling — tool descriptions rewritten for reliable chaining |
-| **v1.5.2** | 2026-02-19 | Stop stripping stdout — pass URLs through as-is |
-| **v1.5.1** | 2026-02-19 | Plain text URL format (still broken due to stdout stripping) |
-| **v1.5.0** | 2026-02-18 | Content blocks introduced (broke URL passing) |
-| **v1.2.0** | 2026-02-15 | Initial working version — JSON response with URLs in stdout |
+| Version | Date | Component | Changes |
+|---------|------|-----------|---------|
+| **v2.8.4** | 2026-02-28 | executor, main | datetime convenience aliases (timedelta, timezone, date); unified version across all components |
+| **v2.8.3** | 2026-02-22 | executor | /app/sandbox_data added to allowed read paths |
+| **v2.8.2** | 2026-02-22 | executor | Read-only upload access for files outside sandbox |
+| **v2.8.1** | 2026-02-22 | executor | /tmp/ path interception and redirect to sandbox |
+| **v2.8.0** | 2026-02-22 | executor | Defensive path normalization (doubled session prefix) |
+| **v2.7.0** | 2026-02-21 | executor | reportlab + matplotlib PDF backend allowlisted |
+| **v2.6** | 2026-02-20 | executor | Critical fix: matplotlib.pyplot alias override bug |
+| **v1.8.2** | 2026-02-23 | mcp_server | load_dataset description updated for universal format |
+| **v1.8.1** | 2026-02-23 | main, mcp_server | Chart serve route + base64 stdout regex fallback |
+| **v1.8.0** | 2026-02-22 | mcp_server | Base64 ImageContent blocks for charts |
+| **v1.7.2** | 2026-02-22 | mcp_server | fetch_from_url route fix (404 → correct path) |
+| **v1.7.1** | 2026-02-22 | mcp_server | FastMCP constructor fix (removed unsupported kwarg) |
+| **v1.7.0** | 2026-02-21 | mcp_server | fetch_from_url tool added |
+| **v1.6.0** | 2026-02-20 | mcp_server | Auto file handling — tool descriptions rewritten |
+| **v1.5.2** | 2026-02-19 | mcp_server | Stop stripping stdout — pass URLs through as-is |
+| **v1.5.1** | 2026-02-19 | mcp_server | Plain text URL format (still broken) |
+| **v1.5.0** | 2026-02-18 | mcp_server | Content blocks introduced (broke URL passing) |
+| **v1.2.0** | 2026-02-15 | all | Initial working version |
+
+---
+
+## Smoke Test Results (v2.8.4 — 2026-02-28)
+
+All capabilities verified:
+
+| Category | Tests | Status |
+|----------|-------|--------|
+| Environment | Python 3.11+, 15/15 libraries | ✅ |
+| datetime aliases | timedelta, timezone, date at top level | ✅ |
+| time module safety | `import time` not shadowed | ✅ |
+| Session persistence | Variables survive across calls | ✅ |
+| Data analysis | Revenue, margins, pivots | ✅ |
+| Chart generation | 4-panel matplotlib PNG | ✅ |
+| File export | CSV, Excel (4 sheets), JSON | ✅ |
+| Universal data loading | CSV, Excel, PDF, JSON, Parquet | ✅ |
 
 ---
 
 ## Author
 
-Built by **AI**, at New Carrot Farms LLC.
+Built by **Kaffer AI** for **Timothy Escamilla**, CEO at New Carrot Farms LLC.
 
 Part of the AI infrastructure stack for business analytics, M&A due diligence, and operational intelligence.
