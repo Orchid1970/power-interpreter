@@ -13,6 +13,7 @@ Executes Python code in a controlled environment with:
 - /tmp/ PATH INTERCEPTION (v2.8.1) - redirect /tmp/ paths to sandbox
 - READ-ONLY UPLOAD ACCESS (v2.8.2) - sandbox can read uploaded files
 - SANDBOX PATH RECOGNITION (v2.8.3) - /app/sandbox_data in allowed paths
+- DATETIME CONVENIENCE ALIASES (v2.8.4) - timedelta, timezone, date at top level
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -72,7 +73,21 @@ v2.8.3 - Sandbox path recognition
   the normalizer and safe_open now explicitly recognize it as legitimate
   rather than relying on fall-through behavior. Defensive improvement.
 
-Version: 2.8.3
+v2.8.4 - datetime convenience aliases
+  Added timedelta, timezone, date as top-level sandbox globals so that
+  analysts can write timedelta(days=30), timezone.utc, date.today()
+  without needing 'from datetime import timedelta' etc.
+  
+  Also added datetime block to _lazy_import for belt-and-suspenders
+  coverage when preprocessor encounters 'import datetime'.
+  
+  NOTE: We intentionally do NOT add datetime.time as a top-level alias
+  because it would shadow the 'time' module in _lazy_import. If someone
+  writes 'import time' after we set time=datetime.time, the preprocessor
+  would see 'time' in globals and skip the import — giving them
+  datetime.time instead of the time module. Bad.
+
+Version: 2.8.4
 """
 
 import asyncio
@@ -526,6 +541,14 @@ class SandboxExecutor:
 
             # Standard library
             'datetime': dt_module,
+            # v2.8.4: datetime convenience aliases
+            # Available at top level so analysts can write timedelta(days=30),
+            # timezone.utc, date.today() without explicit from-imports.
+            # NOTE: We do NOT alias datetime.time here — it would shadow
+            # the 'time' module in _lazy_import.
+            'timedelta': dt_module.timedelta,
+            'timezone': dt_module.timezone,
+            'date': dt_module.date,
             'collections': collections,
             'itertools': itertools,
             'functools': functools,
@@ -1071,6 +1094,21 @@ class SandboxExecutor:
                 import time as time_module
                 sandbox_globals['time'] = time_module
                 return True
+            # ============================================================
+            # v2.8.4: datetime — module + convenience aliases
+            # Pre-injects timedelta, timezone, date at top level so
+            # analysts can write timedelta(days=30) without from-imports.
+            # NOTE: Does NOT inject datetime.time (would shadow time module)
+            # ============================================================
+            elif name == 'datetime':
+                import datetime as _dt_mod
+                sandbox_globals['datetime'] = _dt_mod
+                # Pre-inject commonly used datetime subclasses for convenience
+                sandbox_globals['timedelta'] = _dt_mod.timedelta
+                sandbox_globals['timezone'] = _dt_mod.timezone
+                sandbox_globals['date'] = _dt_mod.date
+                logger.info("Loaded datetime module + timedelta, timezone, date")
+                return True
             elif name == 'calendar':
                 import calendar
                 sandbox_globals['calendar'] = calendar
@@ -1434,6 +1472,7 @@ class SandboxExecutor:
         v2.8.1: /tmp/ and other absolute paths redirected to sandbox.
         v2.8.2: Upload paths permitted for read-only access.
         v2.8.3: /app/sandbox_data recognized as legitimate path.
+        v2.8.4: datetime convenience aliases (timedelta, timezone, date).
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
