@@ -13,7 +13,7 @@ Features:
 - Auto file storage in Postgres with public download URLs
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.8.1
+Version: 2.8.4
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -24,6 +24,13 @@ HISTORY:
            didn't exist. Now serves chart PNG bytes from Postgres with
            correct Content-Type. Public endpoint, no auth (same as /dl/).
            Evidence: "GET /charts/chart-test-v181/chart_001.png 404"
+  v1.8.2: Universal data loading. load_dataset tool description updated to
+           reflect that the backend now auto-detects file format from extension:
+           CSV, Excel (.xlsx/.xls), PDF (table extraction), JSON, Parquet.
+  v2.8.4: Unified version bump. executor.py v2.8.4 adds datetime convenience
+           aliases (timedelta, timezone, date) at top level in sandbox globals.
+           main.py version string, FastAPI app version, and MCP serverInfo
+           all aligned to v2.8.4.
 """
 
 import logging
@@ -56,7 +63,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.8.1 starting...")
+    logger.info("Power Interpreter MCP v2.8.4 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -172,7 +179,7 @@ app = FastAPI(
         "Generated files get persistent download URLs via /dl/{file_id}. "
         "Charts served at /charts/{session_id}/{filename}."
     ),
-    version="1.8.1",
+    version="2.8.4",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -289,7 +296,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v1.8.1",
+                    "X-Power-Interpreter": "chart-serve-v2.8.4",
                 }
             )
 
@@ -496,7 +503,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.8.1",
+                    "version": "2.8.4",
                 },
             },
         }
