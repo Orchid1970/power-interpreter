@@ -1,30 +1,13 @@
 """
 fetch_from_url.py
-─────────────────
+-----------------
 MCP Tool: fetch_from_url
 
 Allows the sandbox to pull a file directly from any accessible URL
 (Cloudinary CDN, S3, public HTTPS) and save it into the sandbox data
-directory so execute_code can immediately open it.
+directory so execute_code can work with it.
 
-This solves the #1 blocker: SimTheory uploads files to Cloudinary CDN
-but the base64 upload_file path was broken. Now we bypass that entirely —
-SimTheory passes the CDN URL and the server fetches it directly.
-
-Usage (from MCP client / SimTheory):
-    tool: fetch_from_url
-    args:
-        url: "https://cdn.simtheory.ai/raw/upload/v.../myfile.xlsx"
-        filename: "myfile.xlsx"          # optional — inferred from URL if omitted
-        session_id: "default"            # optional — defaults to "default"
-
-Returns:
-    {
-        "success": true,
-        "path": "/app/sandbox_data/default/myfile.xlsx",
-        "size_bytes": 212789,
-        "filename": "myfile.xlsx"
-    }
+Uses stdlib urllib (no httpx dependency) for maximum reliability.
 """
 
 import os
@@ -32,12 +15,12 @@ import re
 import logging
 from pathlib import Path
 from urllib.parse import urlparse
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# -- Config ----------------------------------------------------------------
 SANDBOX_BASE = Path(os.environ.get("SANDBOX_DATA_DIR", "/app/sandbox_data"))
 MAX_FILE_SIZE_BYTES = int(os.environ.get("MAX_FETCH_SIZE_MB", "500")) * 1024 * 1024
 ALLOWED_EXTENSIONS = {
@@ -97,16 +80,16 @@ def fetch_from_url(
     """
     logger.info(f"fetch_from_url: url={url!r}, filename={filename!r}, session={session_id!r}")
 
-    # ── Validate URL ──────────────────────────────────────────────────────────
+    # -- Validate URL ----------------------------------------------------------
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return {"success": False, "error": f"Only http/https URLs are supported. Got: {parsed.scheme!r}"}
 
-    # ── Prepare destination ───────────────────────────────────────────────────
+    # -- Prepare destination ---------------------------------------------------
     session_dir = SANDBOX_BASE / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Fetch ─────────────────────────────────────────────────────────────────
+    # -- Fetch -----------------------------------------------------------------
     try:
         req = Request(url, headers={"User-Agent": "PowerInterpreter/1.0"})
         with urlopen(req, timeout=TIMEOUT_SECONDS) as response:
@@ -153,7 +136,7 @@ def fetch_from_url(
         logger.exception(f"fetch_from_url unexpected error for {url}")
         return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
-    logger.info(f"fetch_from_url: saved {filename} ({total_bytes:,} bytes) → {dest_path}")
+    logger.info(f"fetch_from_url: saved {filename} ({total_bytes:,} bytes) -> {dest_path}")
 
     return {
         "success": True,
