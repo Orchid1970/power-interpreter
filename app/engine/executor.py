@@ -14,6 +14,7 @@ Executes Python code in a controlled environment with:
 - READ-ONLY UPLOAD ACCESS (v2.8.2) - sandbox can read uploaded files
 - SANDBOX PATH RECOGNITION (v2.8.3) - /app/sandbox_data in allowed paths
 - DATETIME MODULE FIX (v2.8.4) - datetime injected as MODULE, not class
+- DOCX TRANSITIVE DEPS (v2.8.5) - zipfile, lxml, xml, pkgutil, importlib
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -94,7 +95,21 @@ v2.8.4 - datetime module injection fix
      (Backported from BolthouseFreshFoods — fixes the root cause, not just
      the symptom.)
 
-Version: 2.8.4
+v2.8.5 - python-docx transitive dependency fix
+  python-docx requires several stdlib modules that were not in the
+  _lazy_import allowlist:
+  - zipfile: .docx files are ZIP archives
+  - lxml: XML parsing (primary parser for python-docx)
+  - xml: stdlib XML modules (fallback parser)
+  - pkgutil: package discovery
+  - importlib: import machinery for transitive deps
+  
+  Also added python-docx (docx) itself to the allowlist.
+  
+  Without these, 'from docx import Document' fails with:
+  NameError: 'zipfile' is not defined
+
+Version: 2.8.5
 """
 
 import asyncio
@@ -136,6 +151,7 @@ STORABLE_EXTENSIONS = {
     '.xlsx', '.xls', '.csv', '.tsv', '.json',
     '.pdf', '.png', '.jpg', '.jpeg', '.svg',
     '.html', '.txt', '.md', '.zip', '.parquet',
+    '.docx', '.doc',  # v2.8.5: Word documents
 }
 
 # Image extensions for inline rendering
@@ -1041,7 +1057,6 @@ class SandboxExecutor:
             # ============================================================
             elif name == 'reportlab':
                 import reportlab
-                # Pre-import commonly used submodules so attribute access works
                 import reportlab.lib
                 import reportlab.lib.pagesizes
                 import reportlab.lib.styles
@@ -1099,18 +1114,10 @@ class SandboxExecutor:
                 return True
             # ============================================================
             # v2.8.4: datetime — inject MODULE with convenience aliases
-            # Previously, datetime was only in _build_safe_globals but NOT
-            # in _lazy_import. When _preprocess_code saw 'from datetime
-            # import datetime', it rewrote it as 'datetime = datetime.datetime'
-            # which OVERWROTE the module with the class. Now _lazy_import
-            # returns True, so the preprocessor comments out the import
-            # instead of rewriting it destructively.
             # ============================================================
             elif name == 'datetime':
                 import datetime as _dt_mod
                 sandbox_globals['datetime'] = _dt_mod
-                # Pre-inject commonly used datetime subclasses for convenience
-                # so 'from datetime import timedelta' etc. just works
                 sandbox_globals['timedelta'] = _dt_mod.timedelta
                 sandbox_globals['timezone'] = _dt_mod.timezone
                 sandbox_globals['date'] = _dt_mod.date
@@ -1166,6 +1173,79 @@ class SandboxExecutor:
                 import glob
                 sandbox_globals['glob'] = glob
                 return True
+            # ============================================================
+            # v2.8.5: python-docx transitive dependencies
+            # .docx files are ZIP archives containing XML.
+            # python-docx requires zipfile, lxml, xml at minimum.
+            # Also adding pkgutil and importlib for package discovery.
+            # ============================================================
+            elif name == 'zipfile':
+                import zipfile
+                sandbox_globals['zipfile'] = zipfile
+                logger.info("Loaded zipfile (ZIP archive support)")
+                return True
+            elif name == 'lxml':
+                try:
+                    import lxml
+                    import lxml.etree
+                    sandbox_globals['lxml'] = lxml
+                    logger.info("Loaded lxml (XML parsing)")
+                    return True
+                except ImportError:
+                    logger.warning("lxml not installed")
+                    return False
+            elif name == 'xml':
+                import xml
+                import xml.etree
+                import xml.etree.ElementTree
+                try:
+                    import xml.dom
+                    import xml.dom.minidom
+                except ImportError:
+                    pass
+                try:
+                    import xml.sax
+                except ImportError:
+                    pass
+                sandbox_globals['xml'] = xml
+                logger.info("Loaded xml (stdlib XML support)")
+                return True
+            elif name == 'pkgutil':
+                import pkgutil
+                sandbox_globals['pkgutil'] = pkgutil
+                return True
+            elif name == 'importlib':
+                import importlib
+                try:
+                    import importlib.metadata
+                except ImportError:
+                    pass
+                try:
+                    import importlib.resources
+                except ImportError:
+                    pass
+                sandbox_globals['importlib'] = importlib
+                return True
+            elif name == 'docx':
+                try:
+                    # python-docx needs zipfile, lxml, xml as transitive deps
+                    # Ensure they're loaded first
+                    import zipfile
+                    sandbox_globals['zipfile'] = zipfile
+                    try:
+                        import lxml
+                        import lxml.etree
+                        sandbox_globals['lxml'] = lxml
+                    except ImportError:
+                        pass  # python-docx can fall back to stdlib xml
+                    import xml.etree.ElementTree
+                    import docx
+                    sandbox_globals['docx'] = docx
+                    logger.info("Loaded python-docx (Word document support)")
+                    return True
+                except ImportError:
+                    logger.warning("python-docx not installed")
+                    return False
         except ImportError as e:
             logger.warning(f"Failed to import {name}: {e}")
             return False
@@ -1240,17 +1320,8 @@ class SandboxExecutor:
 
                                     # ============================================================
                                     # v2.8.4: GUARD against overwriting module with its own class
-                                    # 'from datetime import datetime' would generate:
-                                    #   datetime = datetime.datetime
-                                    # which DESTROYS the module reference. Instead, check if the
-                                    # alias already exists in sandbox_globals (set by _lazy_import
-                                    # or _build_safe_globals) and skip if so.
-                                    # (Backported from BolthouseFreshFoods)
                                     # ============================================================
                                     if alias in sandbox_globals and alias == base_module:
-                                        # The user wants 'datetime' to be the class, but we
-                                        # can't destroy the module. The class is available as
-                                        # datetime.datetime, so this is safe to skip.
                                         logger.debug(
                                             f"Skipping '{alias} = {module_path}.{original}' "
                                             f"to preserve module reference in sandbox_globals"
@@ -1349,7 +1420,6 @@ class SandboxExecutor:
                         if ' as ' in stripped:
                             alias = stripped.split(' as ')[-1].strip()
                             if alias not in sandbox_globals:
-                                # Same resolution logic for already-loaded modules
                                 full_module = stripped.split()[1]
                                 if ' as ' in full_module:
                                     full_module = full_module.split(' as ')[0].strip()
@@ -1506,6 +1576,7 @@ class SandboxExecutor:
         v2.8.2: Upload paths permitted for read-only access.
         v2.8.3: /app/sandbox_data recognized as legitimate path.
         v2.8.4: datetime module preserved through import preprocessing.
+        v2.8.5: python-docx transitive deps (zipfile, lxml, xml) allowed.
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
@@ -1563,9 +1634,6 @@ class SandboxExecutor:
         logger.info(f"Processed code preview: {processed_code[:300]}")
 
         # CHART CAPTURE setup
-        # NOTE: This is intentionally AFTER _preprocess_code because preprocessing
-        # may lazy-load matplotlib into sandbox_globals. The check below will
-        # correctly detect plt/matplotlib that was just loaded by preprocessing.
         chart_capture = ChartCapture(session_dir)
         if 'plt' in sandbox_globals or 'matplotlib' in sandbox_globals:
             self._install_chart_hooks(sandbox_globals, chart_capture)
