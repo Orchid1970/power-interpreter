@@ -3,59 +3,43 @@
 Defines the MCP tools that SimTheory.ai can call.
 This maps MCP tool calls to the FastAPI endpoints.
 
-MCP Tools (12):
+MCP Tools (33):
 - execute_code: Run Python code (sync, <60s)
 - submit_job: Submit long-running job (async)
 - get_job_status: Check job progress
 - get_job_result: Get completed job output
 - upload_file: Upload a file (base64) to sandbox
 - fetch_file: Download a file from URL to sandbox
-- fetch_from_url: ★ Load file from CDN/URL directly into sandbox
+- fetch_from_url: Load file from CDN/URL directly into sandbox
 - list_files: List sandbox files
 - load_dataset: Load data file into PostgreSQL (CSV, Excel, PDF, JSON, Parquet)
 - query_dataset: SQL query against datasets
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
+- ms_auth_status: Check Microsoft 365 auth status (OneDrive/SharePoint)
+- ms_auth_start: Start Microsoft device login flow
+- ms_auth_poll: Complete Microsoft device login after code entry
+- resolve_share_link: Resolve SharePoint/OneDrive sharing URL
+- onedrive_list_files: List files/folders in OneDrive
+- onedrive_search: Search OneDrive by name or content
+- onedrive_download_file: Download file from OneDrive
+- onedrive_upload_file: Upload file to OneDrive
+- onedrive_create_folder: Create folder in OneDrive
+- onedrive_delete_item: Delete file/folder from OneDrive
+- onedrive_move_item: Move item in OneDrive
+- onedrive_copy_item: Copy item in OneDrive
+- onedrive_share_item: Create sharing link
+- sharepoint_list_sites: List/search SharePoint sites
+- sharepoint_get_site: Get SharePoint site details
+- sharepoint_list_drives: List document libraries in a site
+- sharepoint_list_files: List files in SharePoint library
+- sharepoint_download_file: Download from SharePoint
+- sharepoint_upload_file: Upload to SharePoint
+- sharepoint_search: Search within SharePoint site
+- sharepoint_list_lists: List SharePoint lists
+- sharepoint_list_items: List items in a SharePoint list
 
-Version: 1.8.2 - fix: load_dataset now documents universal format support
-
-HISTORY:
-  v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
-  v1.5.0: Introduced content blocks. Stripped URLs from stdout, tried to rebuild
-           from inline_images[]/download_urls[] arrays. Those arrays were empty
-           due to parallel execution race in executor.py. URLs LOST.
-  v1.5.1: Switched from markdown to plain text URLs. Still stripped stdout. Still broken.
-  v1.5.2: Stop stripping stdout. Pass URLs through as-is. Belt-and-suspenders:
-           also create extra blocks from JSON arrays if populated.
-  v1.6.0: Auto File Handling. Rewrote tool descriptions so the AI reliably
-           chains fetch_file -> execute_code, upload_file -> execute_code,
-           and fetch_file -> load_dataset -> query_dataset. No logic changes.
-  v1.7.0: fetch_from_url tool added. Streams files directly from any HTTPS URL
-           (Cloudinary CDN, S3, public URLs) into sandbox. Fixes Priority 1
-           file upload blocker — no base64 overhead, no SimTheory encoding bug.
-  v1.7.1: Fix TypeError — FastMCP() does not accept 'description' kwarg in the
-           installed version. Removed it. App now starts cleanly.
-  v1.7.2: Fix 404 — fetch_from_url was POSTing to /api/files/fetch-from-url
-           which does not exist. Correct route is /api/files/fetch. Fixed.
-  v1.8.0: Charts now render inline via base64 ImageContent blocks. BUT: relied
-           on inline_images[] JSON array which is empty due to executor race
-           condition (documented since v1.5.0). Enrichment never fired.
-  v1.8.1: Fix the v1.8.0 miss. Two changes:
-           1. When inline_images[] is empty (the common case), scan stdout for
-              /dl/{uuid}/{filename} URLs via regex. Extract file_id + filename,
-              fetch bytes from internal /dl/ route, base64 encode, return as
-              MCP ImageContent block. This is the RELIABLE path.
-           2. Strip markdown image syntax from stdout text block so SimTheory
-              doesn't also try to render it (it rewrites URLs wrong -> 404).
-           Evidence from v1.8.0 smoke test logs:
-             - "Built 2 content blocks" = only text, no images (inline_images was empty)
-             - "GET /charts/chart-test-v180/chart_001.png 404" = SimTheory rewrote URL
-  v1.8.2: Universal data loading. load_dataset tool description updated to
-           reflect that the backend now auto-detects file format from extension:
-           CSV, Excel (.xlsx/.xls), PDF (table extraction), JSON, Parquet.
-           No more "Load a CSV file" — it loads ANY supported format.
-           Backend: data_manager.py uses detect_format() + format-specific readers.
-           The /api/data/load-csv endpoint is preserved as backwards-compatible alias.
+Version: 1.9.2 - fix: token persistence, auth poll, memory guard
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -69,27 +53,27 @@ import re
 
 logger = logging.getLogger(__name__)
 
-# MCP Server — name only, no description kwarg (not supported in installed fastmcp version)
+# MCP Server
 mcp = FastMCP("Power Interpreter")
+
+# Microsoft integration (initialized AFTER base tools — see bottom of file)
+_ms_auth, _ms_graph = None, None
 
 # Internal API base URL
 _default_base = "http://127.0.0.1:8080"
 API_BASE = os.getenv("API_BASE_URL", _default_base)
 API_KEY = os.getenv("API_KEY", "")
 
-# Max image size to base64 encode (5MB). Larger images get text URL fallback.
+# Max image size to base64 encode (5MB)
 MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
 
-# Regex to find our /dl/{uuid}/{filename} image URLs in stdout
-# Matches: https://power-interpreter-production.up.railway.app/dl/f675f421-4c1c-4418-9c81-0c916c2afff7/chart_001.png
-# Also matches: http://127.0.0.1:8080/dl/... (internal)
+# Regex to find /dl/{uuid}/{filename} image URLs in stdout
 _DL_IMAGE_URL_RE = re.compile(
     r'(https?://[^\s\)]+/dl/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([^\s\)\]]+\.(?:png|jpg|jpeg|svg|gif)))',
     re.IGNORECASE
 )
 
 # Regex to strip markdown image syntax from stdout
-# Matches: ![anything](url)  and also plain "Generated charts:\n\n" prefix
 _MARKDOWN_IMAGE_RE = re.compile(
     r'!\[[^\]]*\]\([^\)]*\.(?:png|jpg|jpeg|svg|gif)\)',
     re.IGNORECASE
@@ -108,19 +92,11 @@ def _headers():
 
 
 # ============================================================
-# IMAGE HELPERS (v1.8.0 + v1.8.1 fixes)
+# IMAGE HELPERS (v1.8.0 + v1.8.1)
 # ============================================================
 
 async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
-    """Fetch image bytes from internal /dl/ route, return MCP ImageContent block.
-
-    Uses the internal API_BASE (127.0.0.1:8080) to avoid going through
-    the public Railway domain. The /dl/ route is unauthenticated.
-
-    Returns:
-        {"type": "image", "data": "<base64>", "mimeType": "image/png"}
-        or None if fetch fails.
-    """
+    """Fetch image bytes from internal /dl/ route, return MCP ImageContent block."""
     from urllib.parse import quote
     encoded_filename = quote(filename)
     internal_url = f"{API_BASE}/dl/{file_id}/{encoded_filename}"
@@ -130,20 +106,13 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
             resp = await client.get(internal_url)
 
             if resp.status_code != 200:
-                logger.warning(
-                    f"Image fetch failed: {internal_url} -> HTTP {resp.status_code}"
-                )
+                logger.warning(f"Image fetch failed: {internal_url} -> HTTP {resp.status_code}")
                 return None
 
-            # Check size before encoding
             if len(resp.content) > MAX_IMAGE_BASE64_BYTES:
-                logger.warning(
-                    f"Image too large for base64: {filename} "
-                    f"({len(resp.content)} bytes > {MAX_IMAGE_BASE64_BYTES})"
-                )
+                logger.warning(f"Image too large for base64: {filename} ({len(resp.content)} bytes)")
                 return None
 
-            # Determine MIME type from response or filename
             content_type = resp.headers.get('content-type', '')
             if 'png' in content_type or filename.lower().endswith('.png'):
                 mime = 'image/png'
@@ -156,10 +125,7 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
 
             b64 = base64.b64encode(resp.content).decode('utf-8')
 
-            logger.info(
-                f"Image base64 encoded: {filename} "
-                f"({len(resp.content)} bytes -> {len(b64)} chars base64, {mime})"
-            )
+            logger.info(f"Image base64 encoded: {filename} ({len(resp.content)} bytes -> {len(b64)} chars, {mime})")
 
             return {
                 "type": "image",
@@ -173,14 +139,7 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
 
 
 def _extract_image_urls_from_stdout(stdout: str) -> List[Tuple[str, str, str]]:
-    """Extract /dl/{uuid}/{filename} image URLs from stdout text.
-
-    v1.8.1: This is the RELIABLE path. The executor appends chart URLs
-    to stdout as markdown: ![chart_001](https://.../dl/{uuid}/chart_001.png)
-    The inline_images[] JSON array is often empty due to a race condition.
-
-    Returns list of (full_url, file_id, filename) tuples.
-    """
+    """Extract /dl/{uuid}/{filename} image URLs from stdout text."""
     matches = _DL_IMAGE_URL_RE.findall(stdout)
     if matches:
         logger.info(f"Found {len(matches)} image URL(s) in stdout via regex")
@@ -190,30 +149,15 @@ def _extract_image_urls_from_stdout(stdout: str) -> List[Tuple[str, str, str]]:
 
 
 def _strip_image_markdown_from_text(text: str) -> str:
-    """Remove markdown image syntax and 'Generated charts:' prefix from text.
-
-    v1.8.1: We strip these because:
-    1. We're returning proper MCP ImageContent blocks (base64) instead
-    2. If we leave the markdown, SimTheory rewrites the URL wrong -> 404
-       Evidence: GET /charts/chart-test-v180/chart_001.png -> 404
-    """
+    """Remove markdown image syntax and 'Generated charts:' prefix from text."""
     cleaned = _MARKDOWN_IMAGE_RE.sub('', text)
     cleaned = _GENERATED_CHARTS_RE.sub('', cleaned)
-    # Clean up any leftover blank lines
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
     return cleaned
 
 
 async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
-    """Replace text-based image URLs with native MCP ImageContent blocks.
-
-    v1.8.1 FIX: Two-path approach:
-      Path A: Use inline_images[] + download_urls[] from JSON (if populated)
-      Path B: Scan stdout for /dl/{uuid}/{filename} URLs via regex (RELIABLE)
-
-    After fetching images as base64, strip the markdown syntax from the
-    stdout text block so SimTheory doesn't also try to render it wrong.
-    """
+    """Replace text-based image URLs with native MCP ImageContent blocks."""
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
@@ -227,14 +171,11 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
     fallback_blocks = []
     images_found = False
 
-    # ------------------------------------------------------------------
-    # PATH A: Use inline_images[] + download_urls[] (v1.8.0 approach)
-    # ------------------------------------------------------------------
+    # PATH A: Use inline_images[] + download_urls[]
     if inline_images:
         logger.info(f"Path A: {len(inline_images)} inline_images in JSON")
         images_found = True
 
-        # Build file_id lookup from download_urls
         file_id_map = {}
         for dl in download_urls:
             if dl.get('is_image'):
@@ -257,17 +198,13 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                     logger.info(f"Path A: image block created for {filename}")
                     continue
 
-            # Fallback: text URL
             if public_url:
                 fallback_blocks.append({
                     "type": "text",
                     "text": f"Chart: {alt_text}\nImage URL: {public_url}"
                 })
-                logger.warning(f"Path A: falling back to text URL for {filename}")
 
-    # ------------------------------------------------------------------
-    # PATH B: Scan stdout for /dl/ URLs (v1.8.1 — the RELIABLE path)
-    # ------------------------------------------------------------------
+    # PATH B: Scan stdout for /dl/ URLs (RELIABLE path)
     if not images_found and stdout:
         url_matches = _extract_image_urls_from_stdout(stdout)
 
@@ -281,18 +218,13 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                     image_blocks.append(block)
                     logger.info(f"Path B: image block created for {filename}")
                 else:
-                    # Fallback: keep the public URL as text
                     fallback_blocks.append({
                         "type": "text",
                         "text": f"Chart: {filename}\nImage URL: {full_url}"
                     })
-                    logger.warning(f"Path B: base64 fetch failed, text fallback for {filename}")
 
-    # ------------------------------------------------------------------
-    # STRIP markdown image syntax from stdout text block
-    # ------------------------------------------------------------------
+    # Strip markdown image syntax from stdout text block
     if image_blocks and blocks:
-        # Find the stdout text block (always the first one) and clean it
         for i, block in enumerate(blocks):
             if block.get('type') == 'text':
                 original_text = block['text']
@@ -300,22 +232,13 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                 if cleaned_text != original_text:
                     if cleaned_text:
                         blocks[i] = {"type": "text", "text": cleaned_text}
-                        logger.info(f"Stripped image markdown from text block {i}")
                     else:
-                        # If stripping left nothing, remove the block entirely
                         blocks[i] = None
-                        logger.info(f"Removed empty text block {i} after stripping")
-                # Only clean the first text block (stdout)
                 break
-
-        # Remove any None blocks
         blocks = [b for b in blocks if b is not None]
 
-    # ------------------------------------------------------------------
-    # INSERT image blocks into response
-    # ------------------------------------------------------------------
+    # Insert image blocks
     if image_blocks or fallback_blocks:
-        # Insert after first remaining text block (or at start if none)
         insert_pos = 0
         for i, block in enumerate(blocks):
             if block.get('type') == 'text':
@@ -325,10 +248,7 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
         for j, block in enumerate(image_blocks + fallback_blocks):
             blocks.insert(insert_pos + j, block)
 
-        logger.info(
-            f"Enriched response: {len(image_blocks)} image blocks, "
-            f"{len(fallback_blocks)} fallback blocks"
-        )
+        logger.info(f"Enriched response: {len(image_blocks)} image blocks, {len(fallback_blocks)} fallback blocks")
 
     return blocks
 
@@ -338,20 +258,7 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
 # ============================================================
 
 def _build_content_blocks(resp_text: str) -> list:
-    """Build MCP content blocks from execute_code API response.
-
-    Returns a LIST of content blocks, not a JSON string.
-    main.py's tools/call handler will use these directly:
-      isinstance(result, list) -> content = result
-
-    CRITICAL DESIGN DECISION (v1.5.2):
-    We do NOT strip URLs from stdout HERE. Stdout is passed through as-is.
-    Image markdown stripping happens later in _enrich_blocks_with_images()
-    ONLY if we successfully create base64 ImageContent blocks to replace them.
-
-    v1.8.0: Removed Block 3 (inline_images text blocks).
-    v1.8.1: Images handled entirely by _enrich_blocks_with_images().
-    """
+    """Build MCP content blocks from execute_code API response."""
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
@@ -359,9 +266,7 @@ def _build_content_blocks(resp_text: str) -> list:
 
     blocks = []
 
-    # Block 1: stdout — PASSED THROUGH UNMODIFIED
-    # (image markdown will be stripped later by _enrich_blocks_with_images
-    #  ONLY if base64 blocks are successfully created)
+    # Block 1: stdout (passed through unmodified)
     stdout = data.get('stdout', '').strip()
     if stdout:
         blocks.append({"type": "text", "text": stdout})
@@ -377,15 +282,9 @@ def _build_content_blocks(resp_text: str) -> list:
             error_text += f"\n\nTraceback:\n{error_tb}"
         blocks.append({"type": "text", "text": error_text})
 
-    # Block 3: REMOVED (v1.8.0)
-    # Images handled by _enrich_blocks_with_images()
-
-    # Block 4: Additional download blocks (non-image files only)
+    # Block 3: Non-image download URLs
     download_urls = data.get('download_urls', [])
-    non_image_downloads = [
-        d for d in download_urls
-        if not d.get('is_image', False)
-    ]
+    non_image_downloads = [d for d in download_urls if not d.get('is_image', False)]
     for info in non_image_downloads:
         filename = info.get('filename', 'file')
         url = info.get('url', '')
@@ -393,7 +292,7 @@ def _build_content_blocks(resp_text: str) -> list:
         if url:
             blocks.append({"type": "text", "text": f"File: {filename} ({size})\nDownload URL: {url}"})
 
-    # Block 5: Metadata
+    # Block 4: Metadata
     meta_parts = []
     exec_time = data.get('execution_time_ms', 0)
     if exec_time:
@@ -406,7 +305,6 @@ def _build_content_blocks(resp_text: str) -> list:
     if meta_parts:
         blocks.append({"type": "text", "text": " | ".join(meta_parts)})
 
-    # Safety: always return at least one block
     if not blocks:
         blocks.append({"type": "text", "text": "Code executed successfully (no output)."})
 
@@ -440,7 +338,6 @@ async def execute_code(
     Args:
         code: Python code to execute. Multi-line strings work fine.
         session_id: Session for state persistence (default: 'default').
-                    Use the same session_id across calls to share state.
         timeout: Max seconds before timeout (default 55, max 59).
     """
     url = f"{API_BASE}/api/execute"
@@ -452,14 +349,8 @@ async def execute_code(
                 headers=_headers(),
                 json={"code": code, "session_id": session_id, "timeout": timeout}
             )
-
-            # Build text content blocks
             blocks = _build_content_blocks(resp.text)
-
-            # v1.8.1: Enrich with native image blocks (base64)
-            # Uses Path A (JSON arrays) or Path B (stdout regex)
             blocks = await _enrich_blocks_with_images(blocks, resp.text)
-
             return blocks
 
     except Exception as e:
@@ -483,28 +374,24 @@ async def fetch_from_url(
 
     Supports:
     - Cloudinary CDN URLs (SimTheory file attachments)
-    - Google Sheets export URLs (?format=xlsx or ?format=csv)
+    - Google Sheets export URLs
     - S3 pre-signed URLs
     - Any public HTTPS download link
 
     WORKFLOW:
       1. fetch_from_url(url="https://...", filename="data.xlsx")
       2. execute_code("import pandas as pd; df = pd.read_excel('data.xlsx')")
-      3. execute_code("print(df.describe())")
 
     Args:
         url: HTTPS URL to download from.
-        filename: Name to save as in sandbox (e.g. 'invoices.xlsx').
-                  If omitted, derived from the URL.
+        filename: Name to save as in sandbox. If omitted, derived from URL.
         session_id: Session for file isolation (default: 'default').
     """
-    # Derive filename from URL if not provided
     if not filename:
         from urllib.parse import urlparse
         parsed = urlparse(url)
         filename = parsed.path.split('/')[-1].split('?')[0] or 'downloaded_file'
 
-    # FIXED v1.7.2: Call /api/files/fetch (correct route in files.py)
     api_url = f"{API_BASE}/api/files/fetch"
     logger.info(f"fetch_from_url: POST {api_url} url={url[:80]} filename={filename}")
 
@@ -546,10 +433,7 @@ async def upload_file(
     """Upload a file to the sandbox via base64 encoding.
 
     Use for files under 10MB. For larger files or URL-accessible files,
-    use fetch_from_url instead (no base64 overhead).
-
-    After uploading, use execute_code to process the file:
-      execute_code("import pandas as pd; df = pd.read_csv('filename.csv')")
+    use fetch_from_url instead.
 
     Args:
         filename: Name to save as (e.g., 'data.csv')
@@ -581,7 +465,6 @@ async def fetch_file(
     """Download a file from a URL into the sandbox.
 
     Alternative to fetch_from_url. Both call the same backend route.
-    Use fetch_from_url for new code (better response formatting).
 
     Args:
         url: URL to download from
@@ -606,10 +489,6 @@ async def fetch_file(
 @mcp.tool()
 async def list_files(session_id: Optional[str] = "default") -> str:
     """List files currently in the sandbox.
-
-    Shows filename, size, type, and a text preview for each file.
-    Use this to confirm a file was successfully uploaded or fetched
-    before trying to process it with execute_code.
 
     Args:
         session_id: Session to list files for (default: 'default')
@@ -639,7 +518,7 @@ async def submit_job(
     session_id: str = "default",
     timeout: int = 600
 ) -> str:
-    """Submit a long-running job for async execution. Returns a job_id immediately.
+    """Submit a long-running job for async execution.
 
     Use for jobs that exceed 60 seconds. Poll with get_job_status,
     then retrieve output with get_job_result.
@@ -668,8 +547,6 @@ async def submit_job(
 async def get_job_status(job_id: str) -> str:
     """Check the status of a submitted job.
 
-    Status values: pending, running, completed, failed, cancelled, timeout
-
     Args:
         job_id: The job ID from submit_job
     """
@@ -696,13 +573,8 @@ async def get_job_result(job_id: str) -> list:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
-
-            # Build text blocks
             blocks = _build_content_blocks(resp.text)
-
-            # v1.8.1: Enrich with native image blocks (base64)
             blocks = await _enrich_blocks_with_images(blocks, resp.text)
-
             return blocks
 
     except Exception as e:
@@ -726,12 +598,9 @@ async def load_dataset(
     Supports multiple file formats — auto-detected from file extension:
       - CSV / TSV (.csv, .tsv, .txt)
       - Excel (.xlsx, .xls, .xlsm, .xlsb)
-      - PDF with tables (.pdf) — extracts tabular data automatically
-      - JSON (.json) — array of objects or records format
+      - PDF with tables (.pdf)
+      - JSON (.json)
       - Parquet (.parquet, .pq)
-
-    Handles large files (1.5M+ rows) via chunked loading into PostgreSQL.
-    Creates indexes automatically on date and ID columns.
 
     WORKFLOW:
       1. fetch_from_url(url, filename="invoices.xlsx")
@@ -739,11 +608,10 @@ async def load_dataset(
       3. query_dataset(sql="SELECT * FROM data_xxx WHERE amount > 1000")
 
     Args:
-        file_path: Filename in sandbox (e.g., 'data.xlsx' — NOT a URL or local path).
-                   Format is auto-detected from the file extension.
-        dataset_name: Logical name for SQL queries (e.g., 'sales', 'invoices')
+        file_path: Filename in sandbox (format auto-detected from extension)
+        dataset_name: Logical name for SQL queries
         session_id: Session for file isolation (default: 'default')
-        delimiter: CSV delimiter (default comma, only used for CSV files)
+        delimiter: CSV delimiter (default comma, CSV only)
     """
     url = f"{API_BASE}/api/data/load-csv"
     logger.info(f"load_dataset: POST {url}")
@@ -770,7 +638,7 @@ async def query_dataset(
     """Execute a SQL query against datasets loaded into PostgreSQL.
 
     Args:
-        sql: SQL SELECT query (e.g., "SELECT * FROM sales WHERE revenue > 1000")
+        sql: SQL SELECT query
         limit: Max rows returned (default 1000)
         offset: Row offset for pagination
     """
@@ -821,9 +689,6 @@ async def create_session(
 ) -> str:
     """Create a new workspace session for file/data isolation.
 
-    The "default" session is automatically available for all normal work.
-    Only create a new session to isolate unrelated projects.
-
     Args:
         name: Session name (e.g., 'vestis-audit', 'financial-model')
         description: Optional description
@@ -841,3 +706,21 @@ async def create_session(
     except Exception as e:
         logger.error(f"create_session: error: {e}", exc_info=True)
         return f"Error calling create_session API: {e}"
+
+
+# ============================================================
+# MICROSOFT 365 INTEGRATION (v1.9.2)
+# Registered AFTER all 12 base tools (v1.9.1 safety fix)
+# ============================================================
+
+try:
+    from app.microsoft.bootstrap import init_microsoft_tools
+    _ms_auth, _ms_graph = init_microsoft_tools(mcp)
+    if _ms_auth:
+        logger.info("Microsoft OneDrive + SharePoint integration: ENABLED (22 tools)")
+    else:
+        logger.info("Microsoft OneDrive + SharePoint integration: SKIPPED (no Azure credentials)")
+except Exception as e:
+    logger.error(f"Microsoft integration failed to initialize: {e}", exc_info=True)
+    logger.info("Continuing with 12 base tools — Microsoft tools unavailable")
+    _ms_auth, _ms_graph = None, None
