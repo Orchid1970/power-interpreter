@@ -13,7 +13,7 @@ Executes Python code in a controlled environment with:
 - /tmp/ PATH INTERCEPTION (v2.8.1) - redirect /tmp/ paths to sandbox
 - READ-ONLY UPLOAD ACCESS (v2.8.2) - sandbox can read uploaded files
 - SANDBOX PATH RECOGNITION (v2.8.3) - /app/sandbox_data in allowed paths
-- DATETIME CONVENIENCE ALIASES (v2.8.4) - timedelta, timezone, date at top level
+- DATETIME MODULE FIX (v2.8.4) - datetime injected as MODULE, not class
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -73,19 +73,26 @@ v2.8.3 - Sandbox path recognition
   the normalizer and safe_open now explicitly recognize it as legitimate
   rather than relying on fall-through behavior. Defensive improvement.
 
-v2.8.4 - datetime convenience aliases
-  Added timedelta, timezone, date as top-level sandbox globals so that
-  analysts can write timedelta(days=30), timezone.utc, date.today()
-  without needing 'from datetime import timedelta' etc.
+v2.8.4 - datetime module injection fix
+  'from datetime import datetime' was broken because:
+  1. _build_safe_globals correctly set 'datetime' = datetime MODULE
+  2. _preprocess_code's from-import handler rewrote it to:
+     datetime = datetime.datetime (the CLASS)
+  3. This OVERWROTE the module reference in sandbox_globals
+  4. Since kernels are persistent, the module was permanently destroyed
+  5. All subsequent datetime.timezone, datetime.timedelta calls failed
   
-  Also added datetime block to _lazy_import for belt-and-suspenders
-  coverage when preprocessor encounters 'import datetime'.
-  
-  NOTE: We intentionally do NOT add datetime.time as a top-level alias
-  because it would shadow the 'time' module in _lazy_import. If someone
-  writes 'import time' after we set time=datetime.time, the preprocessor
-  would see 'time' in globals and skip the import — giving them
-  datetime.time instead of the time module. Bad.
+  Fix:
+  1. Added 'datetime' to _lazy_import() with explicit module handling
+  2. Added timedelta, timezone, date as top-level convenience aliases
+     in both _build_safe_globals() and _lazy_import()
+  3. _lazy_import returns True for datetime, so _preprocess_code
+     comments out the import instead of rewriting it destructively
+  4. GUARD in _preprocess_code from-import handler: when alias == base_module
+     and alias already exists in sandbox_globals, SKIP the assignment to
+     prevent overwriting the module with its own class.
+     (Backported from BolthouseFreshFoods — fixes the root cause, not just
+     the symptom.)
 
 Version: 2.8.4
 """
@@ -540,12 +547,8 @@ class SandboxExecutor:
             'Fraction': Fraction,
 
             # Standard library
+            # v2.8.4: datetime is the MODULE, plus convenience aliases
             'datetime': dt_module,
-            # v2.8.4: datetime convenience aliases
-            # Available at top level so analysts can write timedelta(days=30),
-            # timezone.utc, date.today() without explicit from-imports.
-            # NOTE: We do NOT alias datetime.time here — it would shadow
-            # the 'time' module in _lazy_import.
             'timedelta': dt_module.timedelta,
             'timezone': dt_module.timezone,
             'date': dt_module.date,
@@ -1095,19 +1098,23 @@ class SandboxExecutor:
                 sandbox_globals['time'] = time_module
                 return True
             # ============================================================
-            # v2.8.4: datetime — module + convenience aliases
-            # Pre-injects timedelta, timezone, date at top level so
-            # analysts can write timedelta(days=30) without from-imports.
-            # NOTE: Does NOT inject datetime.time (would shadow time module)
+            # v2.8.4: datetime — inject MODULE with convenience aliases
+            # Previously, datetime was only in _build_safe_globals but NOT
+            # in _lazy_import. When _preprocess_code saw 'from datetime
+            # import datetime', it rewrote it as 'datetime = datetime.datetime'
+            # which OVERWROTE the module with the class. Now _lazy_import
+            # returns True, so the preprocessor comments out the import
+            # instead of rewriting it destructively.
             # ============================================================
             elif name == 'datetime':
                 import datetime as _dt_mod
                 sandbox_globals['datetime'] = _dt_mod
                 # Pre-inject commonly used datetime subclasses for convenience
+                # so 'from datetime import timedelta' etc. just works
                 sandbox_globals['timedelta'] = _dt_mod.timedelta
                 sandbox_globals['timezone'] = _dt_mod.timezone
                 sandbox_globals['date'] = _dt_mod.date
-                logger.info("Loaded datetime module + timedelta, timezone, date")
+                logger.info("Loaded datetime module + timedelta, timezone, date aliases")
                 return True
             elif name == 'calendar':
                 import calendar
@@ -1170,11 +1177,18 @@ class SandboxExecutor:
         CRITICAL FIX (v2.6): For 'import X.Y as Z', do NOT override Z
         if _lazy_import already set it correctly. Previously:
           import matplotlib.pyplot as plt
-          → _lazy_import sets plt = matplotlib.pyplot  ✓
-          → alias logic sets plt = matplotlib           ✗ (OVERWRITES!)
+          -> _lazy_import sets plt = matplotlib.pyplot  OK
+          -> alias logic sets plt = matplotlib           BAD (OVERWRITES!)
         
         Now: if the alias already exists in sandbox_globals after
         _lazy_import, we skip the alias override.
+
+        CRITICAL FIX (v2.8.4): For 'from X import X' (e.g. 'from datetime
+        import datetime'), do NOT generate 'X = X.X' when X already exists
+        as a MODULE in sandbox_globals. That would overwrite the module
+        with its own class, permanently destroying it in persistent kernels.
+        Guard: when alias == base_module and alias is already in globals, skip.
+        (Backported from BolthouseFreshFoods.)
         """
         # First: strip matplotlib.use() calls
         code = self._strip_matplotlib_use(code)
@@ -1223,6 +1237,25 @@ class SandboxExecutor:
                                     else:
                                         original = item
                                         alias = item
+
+                                    # ============================================================
+                                    # v2.8.4: GUARD against overwriting module with its own class
+                                    # 'from datetime import datetime' would generate:
+                                    #   datetime = datetime.datetime
+                                    # which DESTROYS the module reference. Instead, check if the
+                                    # alias already exists in sandbox_globals (set by _lazy_import
+                                    # or _build_safe_globals) and skip if so.
+                                    # (Backported from BolthouseFreshFoods)
+                                    # ============================================================
+                                    if alias in sandbox_globals and alias == base_module:
+                                        # The user wants 'datetime' to be the class, but we
+                                        # can't destroy the module. The class is available as
+                                        # datetime.datetime, so this is safe to skip.
+                                        logger.debug(
+                                            f"Skipping '{alias} = {module_path}.{original}' "
+                                            f"to preserve module reference in sandbox_globals"
+                                        )
+                                        continue
 
                                     assignment_lines.append(
                                         f"{alias} = {module_path}.{original}"
@@ -1472,7 +1505,7 @@ class SandboxExecutor:
         v2.8.1: /tmp/ and other absolute paths redirected to sandbox.
         v2.8.2: Upload paths permitted for read-only access.
         v2.8.3: /app/sandbox_data recognized as legitimate path.
-        v2.8.4: datetime convenience aliases (timedelta, timezone, date).
+        v2.8.4: datetime module preserved through import preprocessing.
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
