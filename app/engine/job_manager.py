@@ -30,6 +30,24 @@ from app.database import get_session_factory
 logger = logging.getLogger(__name__)
 
 
+def _safe_parse_uuid(value: str) -> Optional[uuid.UUID]:
+    """Safely parse a string as UUID, returning None for non-UUID values.
+    
+    The MCP server passes session_id="default" when no explicit session
+    has been created. This prevents uuid.UUID("default") from raising
+    'badly formed hexadecimal UUID string'.
+    
+    Consistent with data_manager._safe_parse_uuid().
+    """
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except (ValueError, AttributeError):
+        logger.debug(f"session_id '{value}' is not a valid UUID, treating as None")
+        return None
+
+
 class JobManager:
     """Manages async code execution jobs"""
     
@@ -57,7 +75,7 @@ class JobManager:
         async with factory() as session:
             job = Job(
                 id=uuid.UUID(job_id),
-                session_id=uuid.UUID(session_id) if session_id else None,
+                session_id=_safe_parse_uuid(session_id),
                 code=code,
                 status=JobStatus.PENDING,
                 submitted_at=datetime.utcnow(),
@@ -246,7 +264,9 @@ class JobManager:
             query = select(Job).order_by(Job.submitted_at.desc()).limit(limit)
             
             if session_id:
-                query = query.where(Job.session_id == uuid.UUID(session_id))
+                parsed_sid = _safe_parse_uuid(session_id)
+                if parsed_sid:
+                    query = query.where(Job.session_id == parsed_sid)
             if status:
                 query = query.where(Job.status == JobStatus(status))
             
