@@ -15,6 +15,7 @@ Executes Python code in a controlled environment with:
 - SANDBOX PATH RECOGNITION (v2.8.3) - /app/sandbox_data in allowed paths
 - DATETIME MODULE FIX (v2.8.4) - datetime injected as MODULE, not class
 - DOCX TRANSITIVE DEPS (v2.8.5) - zipfile, lxml, xml, pkgutil, importlib
+- TIMEOUT FLOOR (v2.8.6) - enforce 100s minimum, AI can't undercut
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -109,7 +110,19 @@ v2.8.5 - python-docx transitive dependency fix
   Without these, 'from docx import Document' fails with:
   NameError: 'zipfile' is not defined
 
-Version: 2.8.5
+v2.8.6 - Timeout floor enforcement
+  AI models (especially Haiku) pass timeout=55 explicitly in execute_code
+  tool calls. The server was honoring whatever value the AI requested with
+  no lower bound, causing premature termination of heavy analyses.
+  
+  Fix: timeout = max(timeout or settings.MAX_EXECUTION_TIME, 100)
+  
+  Effect:
+  - AI passes timeout=55 → server enforces 100s (floor)
+  - AI passes timeout=150 → server uses 150s (respected)
+  - AI passes nothing → server uses 300s (config default)
+
+Version: 2.8.6
 """
 
 import asyncio
@@ -133,6 +146,10 @@ from app.config import settings
 from app.engine.kernel_manager import kernel_manager
 
 logger = logging.getLogger(__name__)
+
+# v2.8.6: Minimum timeout floor in seconds.
+# AI models cannot request less than this, regardless of what they pass.
+MIN_TIMEOUT_SECONDS = 100
 
 
 # Try to import resource module (Unix only, may fail in some containers)
@@ -1577,9 +1594,16 @@ class SandboxExecutor:
         v2.8.3: /app/sandbox_data recognized as legitimate path.
         v2.8.4: datetime module preserved through import preprocessing.
         v2.8.5: python-docx transitive deps (zipfile, lxml, xml) allowed.
+        v2.8.6: Timeout floor enforced at 100s minimum.
         """
         result = ExecutionResult()
-        timeout = timeout or settings.MAX_EXECUTION_TIME
+
+        # ============================================================
+        # v2.8.6: TIMEOUT FLOOR
+        # AI models (especially Haiku) pass timeout=55 explicitly.
+        # Enforce a minimum so heavy analyses don't get killed early.
+        # ============================================================
+        timeout = max(timeout or settings.MAX_EXECUTION_TIME, MIN_TIMEOUT_SECONDS)
 
         logger.info(f"Executing code: session={session_id}, timeout={timeout}s")
         logger.info(f"Code preview: {code[:200]}")
@@ -1634,6 +1658,9 @@ class SandboxExecutor:
         logger.info(f"Processed code preview: {processed_code[:300]}")
 
         # CHART CAPTURE setup
+        # NOTE: This is intentionally AFTER _preprocess_code because preprocessing
+        # may lazy-load matplotlib into sandbox_globals. The check below will
+        # correctly detect plt/matplotlib that was just loaded by preprocessing.
         chart_capture = ChartCapture(session_dir)
         if 'plt' in sandbox_globals or 'matplotlib' in sandbox_globals:
             self._install_chart_hooks(sandbox_globals, chart_capture)
