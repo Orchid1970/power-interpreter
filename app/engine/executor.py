@@ -15,7 +15,7 @@ Executes Python code in a controlled environment with:
 - SANDBOX PATH RECOGNITION (v2.8.3) - /app/sandbox_data in allowed paths
 - DATETIME MODULE FIX (v2.8.4) - datetime injected as MODULE, not class
 - DOCX TRANSITIVE DEPS (v2.8.5) - zipfile, lxml, xml, pkgutil, importlib
-- TIMEOUT FLOOR (v2.8.6) - enforce 100s minimum, AI can't undercut
+- TIMEOUT FLOOR (v2.8.6) - AI can't set timeout below 100s
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -110,14 +110,12 @@ v2.8.5 - python-docx transitive dependency fix
   Without these, 'from docx import Document' fails with:
   NameError: 'zipfile' is not defined
 
-v2.8.6 - Timeout floor enforcement
-  AI models (especially Haiku) pass timeout=55 explicitly in execute_code
-  tool calls. The server was honoring whatever value the AI requested with
-  no lower bound, causing premature termination of heavy analyses.
+v2.8.6 - Timeout floor
+  AI models (especially Haiku) pass explicit timeout=55 in tool calls,
+  which is too short for any real data analysis. The server honored
+  whatever timeout the AI requested.
   
   Fix: timeout = max(timeout or settings.MAX_EXECUTION_TIME, 100)
-  
-  Effect:
   - AI passes timeout=55 → server enforces 100s (floor)
   - AI passes timeout=150 → server uses 150s (respected)
   - AI passes nothing → server uses 300s (config default)
@@ -147,8 +145,11 @@ from app.engine.kernel_manager import kernel_manager
 
 logger = logging.getLogger(__name__)
 
-# v2.8.6: Minimum timeout floor in seconds.
-# AI models cannot request less than this, regardless of what they pass.
+# ============================================================
+# v2.8.6: Minimum timeout floor (seconds)
+# AI models sometimes pass very short timeouts (e.g. 55s) that
+# cause legitimate analyses to fail. This floor prevents that.
+# ============================================================
 MIN_TIMEOUT_SECONDS = 100
 
 
@@ -1594,16 +1595,25 @@ class SandboxExecutor:
         v2.8.3: /app/sandbox_data recognized as legitimate path.
         v2.8.4: datetime module preserved through import preprocessing.
         v2.8.5: python-docx transitive deps (zipfile, lxml, xml) allowed.
-        v2.8.6: Timeout floor enforced at 100s minimum.
+        v2.8.6: Timeout floor — AI can't set below MIN_TIMEOUT_SECONDS.
         """
         result = ExecutionResult()
 
         # ============================================================
         # v2.8.6: TIMEOUT FLOOR
-        # AI models (especially Haiku) pass timeout=55 explicitly.
-        # Enforce a minimum so heavy analyses don't get killed early.
+        # AI models (Haiku especially) pass explicit timeout=55 which
+        # is too short for any real data analysis. Enforce a floor.
+        # - AI passes timeout=55 → server enforces 100s (floor)
+        # - AI passes timeout=150 → server uses 150s (respected)
+        # - AI passes nothing → server uses 300s (config default)
         # ============================================================
+        raw_timeout = timeout
         timeout = max(timeout or settings.MAX_EXECUTION_TIME, MIN_TIMEOUT_SECONDS)
+        if raw_timeout and raw_timeout < MIN_TIMEOUT_SECONDS:
+            logger.warning(
+                f"Timeout floor applied: AI requested {raw_timeout}s, "
+                f"enforcing minimum {MIN_TIMEOUT_SECONDS}s"
+            )
 
         logger.info(f"Executing code: session={session_id}, timeout={timeout}s")
         logger.info(f"Code preview: {code[:200]}")
@@ -1658,9 +1668,6 @@ class SandboxExecutor:
         logger.info(f"Processed code preview: {processed_code[:300]}")
 
         # CHART CAPTURE setup
-        # NOTE: This is intentionally AFTER _preprocess_code because preprocessing
-        # may lazy-load matplotlib into sandbox_globals. The check below will
-        # correctly detect plt/matplotlib that was just loaded by preprocessing.
         chart_capture = ChartCapture(session_dir)
         if 'plt' in sandbox_globals or 'matplotlib' in sandbox_globals:
             self._install_chart_hooks(sandbox_globals, chart_capture)
