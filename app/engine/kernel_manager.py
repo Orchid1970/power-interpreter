@@ -15,9 +15,9 @@ Features:
 - Session metadata tracking (variable count, last activity, execution count)
 - Manual reset capability
 - has_session() check to avoid unnecessary globals rebuilds
+- Per-session execution locks to serialize concurrent calls
 
-Version: 2.1.0 - Add has_session() for executor optimization
-                 Skip _build_safe_globals when kernel already exists
+Version: 2.2.0 - Add per-session exec locks for concurrent call safety
 """
 
 import time
@@ -96,6 +96,7 @@ class KernelManager:
 
     Thread-safe. One namespace per session_id.
     Handles idle cleanup and max kernel limits.
+    Per-session execution locks serialize concurrent calls to the same session.
     """
 
     def __init__(
@@ -105,6 +106,7 @@ class KernelManager:
     ):
         self._sessions: Dict[str, KernelSession] = {}
         self._lock = threading.Lock()
+        self._exec_locks: Dict[str, threading.Lock] = {}
         self.max_kernels = max_kernels
         self.idle_timeout = idle_timeout_seconds
         logger.info(
@@ -112,13 +114,24 @@ class KernelManager:
             f"idle_timeout={idle_timeout_seconds}s"
         )
 
+    def get_exec_lock(self, session_id: str) -> threading.Lock:
+        """Get a per-session execution lock for serializing concurrent calls.
+
+        If SimTheory fires Steps 1-5 simultaneously for session="default",
+        this ensures they queue up and run in order instead of racing.
+        """
+        with self._lock:
+            if session_id not in self._exec_locks:
+                self._exec_locks[session_id] = threading.Lock()
+            return self._exec_locks[session_id]
+
     def has_session(self, session_id: str) -> bool:
         """Check if a session kernel exists (without modifying it).
-        
+
         Used by executor to skip _build_safe_globals() when a kernel
         already exists — significant performance optimization since
         building globals imports pandas, numpy, etc.
-        
+
         Thread-safe. Also cleans up expired sessions.
         """
         with self._lock:
@@ -145,10 +158,8 @@ class KernelManager:
             The persistent sandbox_globals dict for this session
         """
         with self._lock:
-            # Cleanup expired sessions first
             self._cleanup_expired()
 
-            # Return existing session
             if session_id in self._sessions:
                 session = self._sessions[session_id]
                 session.touch()
@@ -160,11 +171,9 @@ class KernelManager:
                 )
                 return session.sandbox_globals
 
-            # Check capacity - evict oldest idle if at max
             if len(self._sessions) >= self.max_kernels:
                 self._evict_oldest()
 
-            # Create new session
             session = KernelSession(
                 session_id=session_id,
                 sandbox_globals=sandbox_globals,
@@ -180,7 +189,7 @@ class KernelManager:
 
     def get_existing(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get existing session globals WITHOUT creating a new session.
-        
+
         Returns None if session doesn't exist.
         Used by executor to get persisted globals and skip _build_safe_globals.
         """
