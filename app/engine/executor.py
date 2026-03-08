@@ -181,25 +181,89 @@ class ChartCapture:
 
 def _is_allowed_read_path(filepath: str) -> bool:
     try:
-        resolved = str(Path(filepath).resolve())
-        for allowed_dir in ALLOWED_READ_PATHS:
-            try:
-                allowed_resolved = str(Path(allowed_dir).resolve())
-                if resolved.startswith(allowed_resolved + '/') or resolved == allowed_resolved:
-                    return True
-            except Exception:
-                if resolved.startswith(allowed_dir + '/') or resolved.startswith(allowed_dir):
-                    return True
-        return False
+        resolved = os.path.realpath(filepath)
+        return any(resolved.startswith(prefix) for prefix in LEGITIMATE_READ_PREFIXES)
     except Exception:
         return False
 
 
-def _is_legitimate_read_path(filepath: str) -> bool:
-    for prefix in LEGITIMATE_READ_PREFIXES:
-        if filepath.startswith(prefix):
-            return True
-    return False
+def _redirect_path(filepath: str, session_dir: Path) -> str:
+    if any(filepath.startswith(prefix) for prefix in REDIRECT_PATH_PREFIXES):
+        filename = os.path.basename(filepath)
+        return str(session_dir / filename)
+    return filepath
+
+
+# =============================================================================
+# SESSION SEQUENCER — Ensures ordered execution of numbered steps
+# =============================================================================
+
+class SessionSequencer:
+    """Manages ordered execution of sequenced calls within a session.
+
+    When multiple execute_code calls arrive simultaneously with sequence numbers,
+    this ensures they execute in order: sequence=1 first, then 2, then 3, etc.
+
+    Calls without sequence numbers bypass the sequencer entirely.
+    """
+
+    def __init__(self):
+        self._condition: Optional[asyncio.Condition] = None
+        self._completed: set = set()
+        self._expected_max: int = 0
+        self._active_batch: bool = False
+
+    @property
+    def condition(self) -> asyncio.Condition:
+        if self._condition is None:
+            self._condition = asyncio.Condition()
+        return self._condition
+
+    async def wait_for_turn(self, sequence: int, timeout: float = 120.0):
+        """Wait until all sequences < this one have completed."""
+        self._active_batch = True
+        self._expected_max = max(self._expected_max, sequence)
+
+        if sequence == 1:
+            return
+
+        async with self.condition:
+            try:
+                await asyncio.wait_for(
+                    self.condition.wait_for(
+                        lambda: all(i in self._completed for i in range(1, sequence))
+                    ),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Sequence {sequence} timed out waiting for predecessors. "
+                    f"Completed: {sorted(self._completed)}. Proceeding anyway."
+                )
+
+    async def mark_completed(self, sequence: int):
+        """Mark a sequence number as done and notify waiters."""
+        self._completed.add(sequence)
+        async with self.condition:
+            self.condition.notify_all()
+
+        if len(self._completed) >= self._expected_max:
+            self._completed.clear()
+            self._expected_max = 0
+            self._active_batch = False
+
+    async def wait_for_batch_clear(self, timeout: float = 120.0):
+        """For non-sequenced calls: wait until any active batch finishes."""
+        if not self._active_batch:
+            return
+        async with self.condition:
+            try:
+                await asyncio.wait_for(
+                    self.condition.wait_for(lambda: not self._active_batch),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Non-sequenced call timed out waiting for batch. Proceeding.")
 
 
 class SandboxExecutor:
@@ -207,26 +271,22 @@ class SandboxExecutor:
         self.sandbox_dir = sandbox_dir or settings.SANDBOX_DIR
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
         self._async_locks: Dict[str, asyncio.Lock] = {}
+        self._sequencers: Dict[str, SessionSequencer] = {}
 
     def _get_async_lock(self, session_id: str) -> asyncio.Lock:
-        """Get a per-session async lock. Non-blocking to the event loop.
-
-        When SimTheory fires multiple execute_code calls simultaneously,
-        they queue up on this lock WITHOUT blocking health checks,
-        list_files, fetch_from_url, or other MCP tools.
-        """
         if session_id not in self._async_locks:
             self._async_locks[session_id] = asyncio.Lock()
         return self._async_locks[session_id]
+
+    def _get_sequencer(self, session_id: str) -> SessionSequencer:
+        if session_id not in self._sequencers:
+            self._sequencers[session_id] = SessionSequencer()
+        return self._sequencers[session_id]
 
     def _get_safe_builtins(self) -> Dict:
         safe = {}
         import builtins as builtins_module
 
-        # NOTE: __import__ is intentionally NOT blocked.
-        # It's needed by libraries that do internal imports (matplotlib, openpyxl, etc.)
-        # Security is enforced by _preprocess_code() which rewrites user import statements,
-        # and by _lazy_import() which controls which top-level modules are available.
         blocked = set(settings.BLOCKED_BUILTINS) if hasattr(settings, 'BLOCKED_BUILTINS') else {
             'eval', 'exec', 'compile', 'globals', 'locals',
             'exit', 'quit', 'breakpoint', 'input',
@@ -242,7 +302,6 @@ class SandboxExecutor:
             except AttributeError:
                 pass
 
-        # Explicitly include __import__ and __build_class__ (needed by exec'd code)
         safe['__import__'] = __import__
         safe['__build_class__'] = getattr(builtins_module, '__build_class__', None)
 
@@ -318,714 +377,440 @@ class SandboxExecutor:
 
         return safe
 
-    def _build_safe_globals(self, session_dir: Path) -> Dict:
+    def _lazy_import(self, module_name: str, alias: str = None):
+        actual_alias = alias or module_name
         try:
-            import pandas as pd
-        except ImportError:
-            pd = None
+            if module_name == 'pandas':
+                import pandas as pd
+                return pd
+            elif module_name == 'numpy':
+                import numpy as np
+                return np
+            elif module_name == 'matplotlib.pyplot':
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                return plt
+            elif module_name == 'matplotlib':
+                import matplotlib
+                matplotlib.use('Agg')
+                return matplotlib
+            elif module_name == 'seaborn':
+                import seaborn as sns
+                return sns
+            elif module_name == 'plotly.express':
+                import plotly.express as px
+                return px
+            elif module_name == 'plotly.graph_objects':
+                import plotly.graph_objects as go
+                return go
+            elif module_name == 'scipy':
+                import scipy
+                return scipy
+            elif module_name == 'sklearn':
+                import sklearn
+                return sklearn
+            elif module_name == 'statsmodels':
+                import statsmodels
+                return statsmodels
+            elif module_name == 'statsmodels.api':
+                import statsmodels.api as sm
+                return sm
+            elif module_name == 'openpyxl':
+                import openpyxl
+                return openpyxl
+            elif module_name == 'pdfplumber':
+                import pdfplumber
+                return pdfplumber
+            elif module_name == 'tabulate':
+                import tabulate
+                return tabulate
+            elif module_name == 'xlsxwriter':
+                import xlsxwriter
+                return xlsxwriter
+            elif module_name == 'json':
+                import json
+                return json
+            elif module_name == 'csv':
+                import csv
+                return csv
+            elif module_name == 'math':
+                import math
+                return math
+            elif module_name == 'statistics':
+                import statistics
+                return statistics
+            elif module_name == 'datetime':
+                import datetime
+                return datetime
+            elif module_name == 'collections':
+                import collections
+                return collections
+            elif module_name == 'itertools':
+                import itertools
+                return itertools
+            elif module_name == 'functools':
+                import functools
+                return functools
+            elif module_name == 're':
+                import re
+                return re
+            elif module_name == 'io':
+                import io
+                return io
+            elif module_name == 'copy':
+                import copy
+                return copy
+            elif module_name == 'hashlib':
+                import hashlib
+                return hashlib
+            elif module_name == 'base64':
+                import base64
+                return base64
+            elif module_name == 'textwrap':
+                import textwrap
+                return textwrap
+            elif module_name == 'string':
+                import string
+                return string
+            elif module_name == 'struct':
+                import struct
+                return struct
+            elif module_name == 'decimal':
+                import decimal
+                return decimal
+            elif module_name == 'fractions':
+                import fractions
+                return fractions
+            elif module_name == 'random':
+                import random
+                return random
+            elif module_name == 'time':
+                import time
+                return time
+            elif module_name == 'calendar':
+                import calendar
+                return calendar
+            elif module_name == 'pprint':
+                import pprint
+                return pprint
+            elif module_name == 'dataclasses':
+                import dataclasses
+                return dataclasses
+            elif module_name == 'typing':
+                import typing
+                return typing
+            elif module_name == 'pathlib':
+                import pathlib
+                return pathlib
+            elif module_name == 'os':
+                import os as os_module
+                return os_module
+            elif module_name == 'sys':
+                import sys as sys_module
+                return sys_module
+            elif module_name == 'urllib':
+                import urllib
+                return urllib
+            elif module_name == 'requests':
+                import requests
+                return requests
+            else:
+                return __import__(module_name)
+        except ImportError as e:
+            logger.warning(f"Module {module_name} not available: {e}")
+            return None
 
-        try:
-            import numpy as np
-        except ImportError:
-            np = None
-
-        import json, csv, math, statistics, collections, itertools, functools, re
-        import datetime as dt_module
-        import io as io_module
-        import copy
-        import hashlib as hashlib_module
-        import base64
-        from decimal import Decimal
-        from fractions import Fraction
-        from pathlib import Path as PathLib
-
-        try:
-            from dataclasses import dataclass, field, asdict
-        except ImportError:
-            dataclass = field = asdict = None
-
-        from typing import Dict, List, Optional, Tuple, Set, Any
-
-        safe_builtins = self._get_safe_builtins()
-        safe_builtins['open'] = self._make_safe_open(session_dir)
-
+    def _build_safe_globals(self, session_dir: Path) -> Dict[str, Any]:
         sandbox_globals = {
-            '__builtins__': safe_builtins,
-            '__name__': '__sandbox__',
-            'json': json, 'csv': csv, 'math': math, 'statistics': statistics,
-            'Decimal': Decimal, 'Fraction': Fraction,
-            'datetime': dt_module, 'timedelta': dt_module.timedelta,
-            'timezone': dt_module.timezone, 'date': dt_module.date,
-            'collections': collections, 'itertools': itertools, 'functools': functools,
-            're': re, 'io': io_module, 'copy': copy,
-            'hashlib': hashlib_module, 'base64': base64,
-            'Path': PathLib,
-            'Dict': Dict, 'List': List, 'Optional': Optional,
-            'Tuple': Tuple, 'Set': Set, 'Any': Any,
+            '__builtins__': self._get_safe_builtins(),
+            '__name__': '__main__',
             'SANDBOX_DIR': str(session_dir),
             'RESULT': None,
         }
 
-        if pd is not None:
-            sandbox_globals['pd'] = pd
-            sandbox_globals['pandas'] = pd
-        if np is not None:
-            sandbox_globals['np'] = np
-            sandbox_globals['numpy'] = np
-        if dataclass is not None:
-            sandbox_globals['dataclass'] = dataclass
-            sandbox_globals['field'] = field
-            sandbox_globals['asdict'] = asdict
+        import_map = {
+            'pd': 'pandas', 'pandas': 'pandas',
+            'np': 'numpy', 'numpy': 'numpy',
+            'json': 'json', 'csv': 'csv',
+            'math': 'math', 'statistics': 'statistics',
+            'datetime': 'datetime', 'collections': 'collections',
+            'itertools': 'itertools', 'functools': 'functools',
+            're': 're', 'io': 'io', 'copy': 'copy',
+            'hashlib': 'hashlib', 'base64': 'base64',
+            'textwrap': 'textwrap', 'string': 'string',
+            'struct': 'struct', 'decimal': 'decimal',
+            'fractions': 'fractions', 'random': 'random',
+            'time': 'time', 'calendar': 'calendar',
+            'pprint': 'pprint', 'dataclasses': 'dataclasses',
+            'typing': 'typing', 'pathlib': 'pathlib',
+            'os': 'os', 'sys': 'sys',
+        }
+
+        for alias, module_name in import_map.items():
+            mod = self._lazy_import(module_name, alias)
+            if mod is not None:
+                sandbox_globals[alias] = mod
+
+        from pathlib import Path as PathClass
+        from dataclasses import dataclass, field, asdict
+        from decimal import Decimal
+        from fractions import Fraction
+        from typing import Dict, List, Optional, Tuple, Set, Any
+
+        sandbox_globals.update({
+            'Path': PathClass,
+            'dataclass': dataclass,
+            'field': field,
+            'asdict': asdict,
+            'Decimal': Decimal,
+            'Fraction': Fraction,
+            'Dict': Dict,
+            'List': List,
+            'Optional': Optional,
+            'Tuple': Tuple,
+            'Set': Set,
+            'Any': Any,
+        })
 
         return sandbox_globals
 
-    def _normalize_path_for_sandbox(self, filepath: str, session_dir: Path) -> str:
-        if not filepath:
-            return filepath
-
-        path_str = str(filepath)
-
-        if _is_legitimate_read_path(path_str):
-            return path_str
-
-        if os.path.isabs(path_str):
-            for prefix in REDIRECT_PATH_PREFIXES:
-                if path_str.startswith(prefix):
-                    basename = os.path.basename(path_str)
-                    if basename:
-                        return basename
-            if len(path_str) >= 3 and path_str[1] == ':' and path_str[2] in ('\\', '/'):
-                basename = os.path.basename(path_str.replace('\\', '/'))
-                if basename:
-                    return basename
-            return path_str
-
-        session_name = session_dir.name
-        prefix_slash = session_name + '/'
-        prefix_sep = session_name + os.sep
-
-        if path_str.startswith(prefix_slash) or path_str.startswith(prefix_sep):
-            stripped = path_str[len(session_name) + 1:]
-            candidate = session_dir / stripped
-            original = session_dir / path_str
-            if candidate.exists() and not original.exists():
-                return stripped
-            elif not original.exists():
-                return stripped
-
-        return path_str
-
-    def _make_safe_open(self, session_dir: Path):
-        normalize = self._normalize_path_for_sandbox
-        _session_dir = session_dir
-
-        def safe_open(filepath, mode='r', *args, **kwargs):
-            path_str = str(filepath)
-            normalized = normalize(path_str, _session_dir)
-            path = Path(normalized)
-            if not path.is_absolute():
-                path = _session_dir / path
-
-            try:
-                resolved = path.resolve()
-                session_resolved = _session_dir.resolve()
-                is_in_session = str(resolved).startswith(str(session_resolved))
-                is_read_only = not any(c in mode for c in ('w', 'a', 'x', '+'))
-                is_allowed_read = is_read_only and _is_allowed_read_path(str(resolved))
-
-                if not is_in_session and not is_allowed_read:
-                    if not is_read_only:
-                        raise PermissionError(f"Access denied: Cannot WRITE outside sandbox. Path: {path_str}")
-                    else:
-                        raise PermissionError(f"Access denied: Cannot access outside sandbox. Path: {path_str}")
-            except PermissionError:
-                raise
-            except Exception as e:
-                raise PermissionError(f"Invalid file path: {e}")
-
-            if any(c in mode for c in ('w', 'a', 'x', '+')):
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-
-            return open(resolved, mode, *args, **kwargs)
-
-        return safe_open
-
-    def _make_path_normalizer(self, session_dir: Path):
-        executor_self = self
-        _session_dir = session_dir
-
-        def _normalize_path(filepath):
-            return executor_self._normalize_path_for_sandbox(str(filepath), _session_dir)
-
-        return _normalize_path
-
-    def _install_pandas_path_hooks(self, sandbox_globals: Dict, session_dir: Path):
-        pd = sandbox_globals.get('pd')
-        if pd is None:
-            return
-
-        normalizer = self._make_path_normalizer(session_dir)
-
-        if not hasattr(pd, '_original_read_csv'):
-            pd._original_read_csv = pd.read_csv
-
-        def _patched_read_csv(filepath_or_buffer, *args, **kwargs):
-            if isinstance(filepath_or_buffer, str):
-                filepath_or_buffer = normalizer(filepath_or_buffer)
-            return pd._original_read_csv(filepath_or_buffer, *args, **kwargs)
-        sandbox_globals['pd'].read_csv = _patched_read_csv
-
-        if not hasattr(pd, '_original_read_excel'):
-            pd._original_read_excel = pd.read_excel
-
-        def _patched_read_excel(io_path, *args, **kwargs):
-            if isinstance(io_path, str):
-                io_path = normalizer(io_path)
-            return pd._original_read_excel(io_path, *args, **kwargs)
-        sandbox_globals['pd'].read_excel = _patched_read_excel
-
-        if not hasattr(pd, '_OriginalExcelFile'):
-            pd._OriginalExcelFile = pd.ExcelFile
-
-        class _PatchedExcelFile(pd._OriginalExcelFile):
-            def __init__(self, path_or_buffer, *args, **kwargs):
-                if isinstance(path_or_buffer, str):
-                    path_or_buffer = normalizer(path_or_buffer)
-                super().__init__(path_or_buffer, *args, **kwargs)
-        sandbox_globals['pd'].ExcelFile = _PatchedExcelFile
-
-        if not hasattr(pd, '_original_read_json'):
-            pd._original_read_json = pd.read_json
-
-        def _patched_read_json(path_or_buf, *args, **kwargs):
-            if isinstance(path_or_buf, str) and not path_or_buf.startswith(('http://', 'https://', '{', '[')):
-                path_or_buf = normalizer(path_or_buf)
-            return pd._original_read_json(path_or_buf, *args, **kwargs)
-        sandbox_globals['pd'].read_json = _patched_read_json
-
-        if not hasattr(pd, '_original_read_parquet'):
-            pd._original_read_parquet = pd.read_parquet
-
-        def _patched_read_parquet(path, *args, **kwargs):
-            if isinstance(path, str):
-                path = normalizer(path)
-            return pd._original_read_parquet(path, *args, **kwargs)
-        sandbox_globals['pd'].read_parquet = _patched_read_parquet
-
-        _original_to_csv = pd.DataFrame.to_csv
-        def _patched_to_csv(self_df, path_or_buf=None, *args, **kwargs):
-            if isinstance(path_or_buf, str):
-                path_or_buf = normalizer(path_or_buf)
-            return _original_to_csv(self_df, path_or_buf, *args, **kwargs)
-        pd.DataFrame.to_csv = _patched_to_csv
-
-        _original_to_excel = pd.DataFrame.to_excel
-        def _patched_to_excel(self_df, excel_writer, *args, **kwargs):
-            if isinstance(excel_writer, str):
-                excel_writer = normalizer(excel_writer)
-            return _original_to_excel(self_df, excel_writer, *args, **kwargs)
-        pd.DataFrame.to_excel = _patched_to_excel
-
-        _original_to_json = pd.DataFrame.to_json
-        def _patched_to_json(self_df, path_or_buf=None, *args, **kwargs):
-            if isinstance(path_or_buf, str):
-                path_or_buf = normalizer(path_or_buf)
-            return _original_to_json(self_df, path_or_buf, *args, **kwargs)
-        pd.DataFrame.to_json = _patched_to_json
-
-        _original_to_parquet = pd.DataFrame.to_parquet
-        def _patched_to_parquet(self_df, path=None, *args, **kwargs):
-            if isinstance(path, str):
-                path = normalizer(path)
-            return _original_to_parquet(self_df, path, *args, **kwargs)
-        pd.DataFrame.to_parquet = _patched_to_parquet
-
-    def _install_chart_hooks(self, sandbox_globals: Dict, chart_capture: ChartCapture):
-        plt = sandbox_globals.get('plt')
-        if plt is None:
-            return
-        plt.show = chart_capture.make_show_replacement(plt)
-        try:
-            import matplotlib.figure
-            if not hasattr(matplotlib.figure.Figure, '_original_savefig'):
-                matplotlib.figure.Figure._original_savefig = matplotlib.figure.Figure.savefig
-            matplotlib.figure.Figure.savefig = chart_capture.make_savefig_wrapper(
-                matplotlib.figure.Figure._original_savefig
-            )
-        except Exception:
-            pass
-
-    def _strip_matplotlib_use(self, code: str) -> str:
-        def _replace_use(match):
-            original = match.group(0).strip()
-            return f"# [sandbox] {original} -> already set (Agg backend)"
-        return MATPLOTLIB_USE_PATTERN.sub(_replace_use, code)
-
-    def _lazy_import(self, name: str, sandbox_globals: Dict):
-        try:
-            if name == 'matplotlib' or name == 'matplotlib.pyplot':
-                import matplotlib
-                matplotlib.use('Agg')
-                import matplotlib.pyplot as plt
-                import matplotlib.patches, matplotlib.gridspec
-                import matplotlib.ticker, matplotlib.colors, matplotlib.cm
-                try: import matplotlib.patheffects
-                except ImportError: pass
-                try: import matplotlib.image
-                except ImportError: pass
-                try: import matplotlib.backends.backend_agg
-                except ImportError: pass
-                try: import matplotlib.backends.backend_pdf
-                except ImportError: pass
-                sandbox_globals['matplotlib'] = matplotlib
-                sandbox_globals['plt'] = plt
-                return True
-            elif name == 'seaborn':
-                import seaborn as sns
-                sandbox_globals['sns'] = sns
-                sandbox_globals['seaborn'] = sns
-                return True
-            elif name == 'plotly' or name == 'plotly.express':
-                import plotly
-                import plotly.express as px
-                import plotly.graph_objects as go
-                try: import plotly.io as pio
-                except ImportError: pass
-                sandbox_globals['plotly'] = plotly
-                sandbox_globals['px'] = px
-                sandbox_globals['go'] = go
-                return True
-            elif name == 'scipy' or name == 'scipy.stats':
-                import scipy, scipy.stats
-                try: import scipy.optimize
-                except ImportError: pass
-                try: import scipy.interpolate
-                except ImportError: pass
-                sandbox_globals['scipy'] = scipy
-                return True
-            elif name == 'sklearn':
-                import sklearn
-                sandbox_globals['sklearn'] = sklearn
-                return True
-            elif name == 'statsmodels':
-                import statsmodels
-                import statsmodels.api as sm
-                sandbox_globals['statsmodels'] = statsmodels
-                sandbox_globals['sm'] = sm
-                return True
-            elif name == 'openpyxl':
-                import openpyxl, openpyxl.styles, openpyxl.utils
-                try: import openpyxl.chart
-                except ImportError: pass
-                try: import openpyxl.worksheet.table
-                except ImportError: pass
-                try: import openpyxl.formatting, openpyxl.formatting.rule
-                except ImportError: pass
-                sandbox_globals['openpyxl'] = openpyxl
-                return True
-            elif name == 'xlsxwriter':
-                import xlsxwriter
-                sandbox_globals['xlsxwriter'] = xlsxwriter
-                return True
-            elif name == 'pdfplumber':
-                import pdfplumber
-                sandbox_globals['pdfplumber'] = pdfplumber
-                return True
-            elif name == 'reportlab':
-                import reportlab, reportlab.lib
-                import reportlab.lib.pagesizes, reportlab.lib.styles
-                import reportlab.lib.units, reportlab.lib.colors, reportlab.lib.enums
-                try:
-                    import reportlab.platypus
-                    import reportlab.platypus.doctemplate, reportlab.platypus.tables
-                    import reportlab.platypus.paragraph, reportlab.platypus.spacer
-                    import reportlab.platypus.flowables
-                except ImportError: pass
-                try: import reportlab.pdfgen, reportlab.pdfgen.canvas
-                except ImportError: pass
-                sandbox_globals['reportlab'] = reportlab
-                return True
-            elif name == 'tabulate':
-                from tabulate import tabulate
-                sandbox_globals['tabulate'] = tabulate
-                return True
-            elif name == 'textwrap':
-                import textwrap
-                sandbox_globals['textwrap'] = textwrap
-                return True
-            elif name == 'string':
-                import string
-                sandbox_globals['string'] = string
-                return True
-            elif name == 'struct':
-                import struct
-                sandbox_globals['struct'] = struct
-                return True
-            elif name == 'decimal':
-                import decimal
-                sandbox_globals['decimal'] = decimal
-                return True
-            elif name == 'fractions':
-                import fractions
-                sandbox_globals['fractions'] = fractions
-                return True
-            elif name == 'random':
-                import random
-                sandbox_globals['random'] = random
-                return True
-            elif name == 'time':
-                import time as time_module
-                sandbox_globals['time'] = time_module
-                return True
-            elif name == 'datetime':
-                import datetime as _dt_mod
-                sandbox_globals['datetime'] = _dt_mod
-                sandbox_globals['timedelta'] = _dt_mod.timedelta
-                sandbox_globals['timezone'] = _dt_mod.timezone
-                sandbox_globals['date'] = _dt_mod.date
-                return True
-            elif name == 'calendar':
-                import calendar
-                sandbox_globals['calendar'] = calendar
-                return True
-            elif name == 'pprint':
-                import pprint
-                sandbox_globals['pprint'] = pprint
-                return True
-            elif name == 'dataclasses':
-                import dataclasses
-                sandbox_globals['dataclasses'] = dataclasses
-                return True
-            elif name == 'typing':
-                import typing
-                sandbox_globals['typing'] = typing
-                return True
-            elif name == 'pathlib':
-                import pathlib
-                sandbox_globals['pathlib'] = pathlib
-                return True
-            elif name == 'os':
-                import os as os_module
-                sandbox_globals['os'] = os_module
-                return True
-            elif name == 'sys':
-                import sys as sys_module
-                sandbox_globals['sys'] = sys_module
-                return True
-            elif name == 'urllib':
-                import urllib, urllib.request, urllib.parse, urllib.error
-                sandbox_globals['urllib'] = urllib
-                return True
-            elif name == 'requests':
-                try:
-                    import requests as requests_module
-                    sandbox_globals['requests'] = requests_module
-                    return True
-                except ImportError:
-                    return False
-            elif name == 'shutil':
-                import shutil
-                sandbox_globals['shutil'] = shutil
-                return True
-            elif name == 'glob':
-                import glob
-                sandbox_globals['glob'] = glob
-                return True
-            elif name == 'docx':
-                try:
-                    import docx
-                    sandbox_globals['docx'] = docx
-                    try:
-                        from docx import Document as _Document
-                        sandbox_globals['Document'] = _Document
-                    except ImportError:
-                        pass
-                    return True
-                except ImportError:
-                    return False
-            elif name == 'zipfile':
-                import zipfile
-                sandbox_globals['zipfile'] = zipfile
-                return True
-            elif name == 'lxml':
-                try:
-                    import lxml
-                    try: import lxml.etree
-                    except ImportError: pass
-                    sandbox_globals['lxml'] = lxml
-                    return True
-                except ImportError:
-                    return False
-            elif name == 'xml':
-                import xml
-                try: import xml.etree, xml.etree.ElementTree
-                except ImportError: pass
-                try: import xml.dom, xml.dom.minidom
-                except ImportError: pass
-                try: import xml.sax
-                except ImportError: pass
-                try: import xml.parsers, xml.parsers.expat
-                except ImportError: pass
-                sandbox_globals['xml'] = xml
-                return True
-            elif name == 'pkgutil':
-                import pkgutil
-                sandbox_globals['pkgutil'] = pkgutil
-                return True
-            elif name == 'importlib':
-                import importlib
-                try: import importlib.resources
-                except ImportError: pass
-                try: import importlib.metadata
-                except ImportError: pass
-                sandbox_globals['importlib'] = importlib
-                return True
-            elif name == 'warnings':
-                import warnings
-                sandbox_globals['warnings'] = warnings
-                return True
-            elif name == 'abc':
-                import abc
-                sandbox_globals['abc'] = abc
-                return True
-            elif name == 'enum':
-                import enum
-                sandbox_globals['enum'] = enum
-                return True
-            elif name == 'weakref':
-                import weakref
-                sandbox_globals['weakref'] = weakref
-                return True
-            elif name == 'io':
-                import io as io_module
-                sandbox_globals['io'] = io_module
-                return True
-            elif name == 'copy':
-                import copy as copy_module
-                sandbox_globals['copy'] = copy_module
-                return True
-        except ImportError as e:
-            logger.warning(f"Failed to import {name}: {e}")
-            return False
-        return False
-
     def _preprocess_code(self, code: str, sandbox_globals: Dict) -> str:
-        code = self._strip_matplotlib_use(code)
+        code = MATPLOTLIB_USE_PATTERN.sub('# matplotlib.use() handled by sandbox', code)
+
         lines = code.split('\n')
         processed_lines = []
 
         for line in lines:
             stripped = line.strip()
 
-            if not stripped or stripped.startswith('#'):
+            if stripped.startswith('#') or not stripped:
                 processed_lines.append(line)
                 continue
 
             if stripped.startswith('import ') or stripped.startswith('from '):
-
-                if stripped.startswith('from '):
-                    try:
-                        parts = stripped.split(' import ', 1)
-                        if len(parts) == 2:
-                            module_path = parts[0].replace('from ', '').strip()
-                            import_names_str = parts[1].strip()
-                            base_module = module_path.split('.')[0]
-
-                            if base_module not in sandbox_globals:
-                                self._lazy_import(base_module, sandbox_globals)
-
-                            if base_module in sandbox_globals:
-                                import_items = [n.strip() for n in import_names_str.split(',')]
-                                assignment_lines = []
-
-                                for item in import_items:
-                                    item = item.strip()
-                                    if not item:
-                                        continue
-                                    if ' as ' in item:
-                                        original, alias = item.split(' as ', 1)
-                                        original = original.strip()
-                                        alias = alias.strip()
-                                    else:
-                                        original = item
-                                        alias = item
-
-                                    if alias in sandbox_globals and alias == base_module:
-                                        continue
-
-                                    assignment_lines.append(f"{alias} = {module_path}.{original}")
-
-                                if assignment_lines:
-                                    processed_lines.append(f"# [sandbox] {stripped}")
-                                    processed_lines.extend(assignment_lines)
-                                    continue
-                                else:
-                                    processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
-                                    continue
-                            else:
-                                processed_lines.append(f"# [sandbox] BLOCKED: {stripped}")
-                                continue
-                        else:
-                            module = stripped.split()[1].split('.')[0]
-                            if self._lazy_import(module, sandbox_globals):
-                                processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
-                                continue
-                            elif module in sandbox_globals:
-                                processed_lines.append(f"# [sandbox] {stripped} -> available")
-                                continue
-                            else:
-                                processed_lines.append(f"# [sandbox] BLOCKED: {stripped}")
-                                continue
-                    except Exception as e:
-                        logger.warning(f"Failed to parse from-import '{stripped}': {e}")
-                        try:
-                            module = stripped.split()[1].split('.')[0]
-                            if self._lazy_import(module, sandbox_globals):
-                                processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
-                                continue
-                            elif module in sandbox_globals:
-                                processed_lines.append(f"# [sandbox] {stripped} -> available")
-                                continue
-                        except Exception:
-                            pass
-                        processed_lines.append(f"# [sandbox] BLOCKED: {stripped}")
-                        continue
-
-                else:
-                    module = stripped.split()[1].split('.')[0].split(',')[0]
-
-                    if self._lazy_import(module, sandbox_globals):
-                        if ' as ' in stripped:
-                            alias = stripped.split(' as ')[-1].strip()
-                            if alias not in sandbox_globals:
-                                full_module = stripped.split()[1].split(' as ')[0].strip() if ' as ' in stripped.split()[1] else stripped.split()[1]
-                                parts = full_module.split('.')
-                                obj = sandbox_globals.get(parts[0])
-                                if obj and len(parts) > 1:
-                                    try:
-                                        for part in parts[1:]:
-                                            obj = getattr(obj, part)
-                                        sandbox_globals[alias] = obj
-                                    except AttributeError:
-                                        sandbox_globals[alias] = sandbox_globals[module]
-                                elif obj:
-                                    sandbox_globals[alias] = obj
-                        processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
-                        continue
-                    elif module in sandbox_globals:
-                        if ' as ' in stripped:
-                            alias = stripped.split(' as ')[-1].strip()
-                            if alias not in sandbox_globals:
-                                full_module = stripped.split()[1]
-                                if ' as ' in full_module:
-                                    full_module = full_module.split(' as ')[0].strip()
-                                parts = full_module.split('.')
-                                obj = sandbox_globals.get(parts[0])
-                                if obj and len(parts) > 1:
-                                    try:
-                                        for part in parts[1:]:
-                                            obj = getattr(obj, part)
-                                        sandbox_globals[alias] = obj
-                                    except AttributeError:
-                                        sandbox_globals[alias] = sandbox_globals[module]
-                                elif obj:
-                                    sandbox_globals[alias] = obj
-                        processed_lines.append(f"# [sandbox] {stripped} -> available")
-                        continue
-                    else:
-                        processed_lines.append(f"# [sandbox] BLOCKED: {stripped}")
-                        continue
+                handled = self._handle_import_line(stripped, sandbox_globals)
+                if handled:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    processed_lines.append(f"{indent}{handled}")
+                    continue
 
             processed_lines.append(line)
 
         return '\n'.join(processed_lines)
 
-    async def _store_files_in_postgres(self, new_file_paths: List[str],
-                                        session_id: str, session_dir: Path) -> List[Dict[str, str]]:
-        if not new_file_paths:
-            return []
+    def _handle_import_line(self, line: str, sandbox_globals: Dict) -> Optional[str]:
+        if line.startswith('import '):
+            parts = line[7:].split(',')
+            assignments = []
+            for part in parts:
+                part = part.strip()
+                if ' as ' in part:
+                    module_name, alias = part.split(' as ', 1)
+                    module_name = module_name.strip()
+                    alias = alias.strip()
+                else:
+                    module_name = part
+                    alias = part.split('.')[0]
 
+                if alias not in sandbox_globals:
+                    mod = self._lazy_import(module_name, alias)
+                    if mod is not None:
+                        sandbox_globals[alias] = mod
+                assignments.append(f"{alias} = {alias}")
+            return '; '.join(assignments) if assignments else '# import handled'
+
+        elif line.startswith('from '):
+            match = re_module.match(r'from\s+([\w.]+)\s+import\s+(.+)', line)
+            if not match:
+                return None
+
+            module_name = match.group(1)
+            imports_str = match.group(2).strip()
+
+            if module_name not in sandbox_globals:
+                mod = self._lazy_import(module_name)
+                if mod is not None:
+                    sandbox_globals[module_name] = mod
+
+            mod = sandbox_globals.get(module_name) or self._lazy_import(module_name)
+            if mod is None:
+                return f"# Module {module_name} not available"
+
+            if imports_str == '*':
+                if hasattr(mod, '__all__'):
+                    for name in mod.__all__:
+                        if hasattr(mod, name):
+                            sandbox_globals[name] = getattr(mod, name)
+                return f"# from {module_name} import * handled"
+
+            assignments = []
+            for item in imports_str.split(','):
+                item = item.strip()
+                if ' as ' in item:
+                    name, alias = item.split(' as ', 1)
+                    name = name.strip()
+                    alias = alias.strip()
+                else:
+                    name = item
+                    alias = item
+
+                if hasattr(mod, name):
+                    sandbox_globals[alias] = getattr(mod, name)
+                    assignments.append(f"{alias} = {alias}")
+                else:
+                    try:
+                        submod = self._lazy_import(f"{module_name}.{name}")
+                        if submod is not None:
+                            sandbox_globals[alias] = submod
+                            assignments.append(f"{alias} = {alias}")
+                    except Exception:
+                        assignments.append(f"# {name} not found in {module_name}")
+
+            return '; '.join(assignments) if assignments else f"# from {module_name} import handled"
+
+        return None
+
+    def _install_chart_hooks(self, sandbox_globals: Dict, chart_capture: ChartCapture):
+        plt_module = sandbox_globals.get('plt')
+        if plt_module:
+            sandbox_globals['plt'].show = chart_capture.make_show_replacement(plt_module)
+
+        matplotlib_module = sandbox_globals.get('matplotlib')
+        if matplotlib_module and hasattr(matplotlib_module, 'pyplot'):
+            matplotlib_module.pyplot.show = chart_capture.make_show_replacement(matplotlib_module.pyplot)
+
+        try:
+            import matplotlib.figure
+            original_savefig = matplotlib.figure.Figure.savefig
+            matplotlib.figure.Figure.savefig = chart_capture.make_savefig_wrapper(original_savefig)
+        except Exception:
+            pass
+
+    def _make_path_normalizer(self, session_dir: Path):
+        def _normalize_path(filepath: str) -> str:
+            return _redirect_path(filepath, session_dir)
+        return _normalize_path
+
+    def _install_pandas_path_hooks(self, sandbox_globals: Dict, session_dir: Path):
+        pd_module = sandbox_globals.get('pd')
+        if not pd_module:
+            return
+
+        original_read_csv = pd_module.read_csv
+        original_read_excel = pd_module.read_excel
+
+        def _patched_read_csv(filepath_or_buffer, *args, **kwargs):
+            if isinstance(filepath_or_buffer, str):
+                filepath_or_buffer = _redirect_path(filepath_or_buffer, session_dir)
+                if not os.path.isabs(filepath_or_buffer):
+                    candidate = session_dir / filepath_or_buffer
+                    if candidate.exists():
+                        filepath_or_buffer = str(candidate)
+            return original_read_csv(filepath_or_buffer, *args, **kwargs)
+
+        def _patched_read_excel(filepath_or_buffer, *args, **kwargs):
+            if isinstance(filepath_or_buffer, str):
+                filepath_or_buffer = _redirect_path(filepath_or_buffer, session_dir)
+                if not os.path.isabs(filepath_or_buffer):
+                    candidate = session_dir / filepath_or_buffer
+                    if candidate.exists():
+                        filepath_or_buffer = str(candidate)
+            return original_read_excel(filepath_or_buffer, *args, **kwargs)
+
+        sandbox_globals['pd'].read_csv = _patched_read_csv
+        sandbox_globals['pd'].read_excel = _patched_read_excel
+
+    async def _store_files_in_postgres(self, new_file_paths: list, session_id: str,
+                                        session_dir: Path) -> list:
         download_info = []
-        max_bytes = settings.SANDBOX_FILE_MAX_MB * 1024 * 1024
-        base_url = settings.public_base_url
-        ttl_hours = settings.SANDBOX_FILE_TTL_HOURS
-
         try:
             from app.database import get_session_factory
             from app.models import SandboxFile
-            from app.routes.files import get_mime_type
 
             factory = get_session_factory()
             async with factory() as db_session:
                 for rel_path in new_file_paths:
-                    try:
-                        file_path = session_dir / rel_path
-                        if not file_path.exists() or not file_path.is_file():
-                            continue
-
-                        ext = file_path.suffix.lower()
-                        if ext not in STORABLE_EXTENSIONS:
-                            continue
-
-                        file_size = file_path.stat().st_size
-                        if file_size > max_bytes or file_size == 0:
-                            continue
-
-                        file_bytes = file_path.read_bytes()
-                        checksum = hashlib.sha256(file_bytes).hexdigest()
-                        mime_type = get_mime_type(file_path.name)
-
-                        expires_at = None
-                        if ttl_hours > 0:
-                            expires_at = datetime.utcnow() + timedelta(hours=ttl_hours)
-
-                        file_id = uuid.uuid4()
-                        sandbox_file = SandboxFile(
-                            id=file_id, session_id=session_id,
-                            filename=file_path.name, mime_type=mime_type,
-                            file_size=file_size, checksum=checksum,
-                            content=file_bytes, expires_at=expires_at,
-                        )
-                        db_session.add(sandbox_file)
-
-                        encoded_filename = quote(file_path.name)
-                        url = f"{base_url}/dl/{file_id}/{encoded_filename}" if base_url else f"/dl/{file_id}/{encoded_filename}"
-
-                        if file_size < 1024:
-                            size_human = f"{file_size} B"
-                        elif file_size < 1024 * 1024:
-                            size_human = f"{file_size / 1024:.1f} KB"
-                        else:
-                            size_human = f"{file_size / (1024 * 1024):.1f} MB"
-
-                        is_image = ext in IMAGE_EXTENSIONS
-
-                        download_info.append({
-                            'filename': file_path.name, 'url': url,
-                            'size': size_human, 'mime_type': mime_type,
-                            'file_id': str(file_id), 'is_image': is_image,
-                            'expires_at': expires_at.isoformat() if expires_at else None,
-                        })
-
-                    except Exception as e:
-                        logger.error(f"Failed to store {rel_path}: {e}")
+                    full_path = session_dir / rel_path
+                    if not full_path.exists():
                         continue
 
-                if download_info:
-                    await db_session.commit()
+                    ext = full_path.suffix.lower()
+                    if ext not in STORABLE_EXTENSIONS:
+                        continue
+
+                    file_data = full_path.read_bytes()
+                    file_size = len(file_data)
+                    file_id = str(uuid.uuid4())
+
+                    content_type_map = {
+                        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                        '.svg': 'image/svg+xml', '.pdf': 'application/pdf',
+                        '.csv': 'text/csv', '.json': 'application/json',
+                        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        '.xls': 'application/vnd.ms-excel',
+                        '.html': 'text/html', '.txt': 'text/plain', '.md': 'text/markdown',
+                        '.zip': 'application/zip', '.parquet': 'application/octet-stream',
+                        '.tsv': 'text/tab-separated-values',
+                        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                        '.doc': 'application/msword',
+                    }
+                    content_type = content_type_map.get(ext, 'application/octet-stream')
+
+                    sandbox_file = SandboxFile(
+                        id=file_id,
+                        session_id=session_id,
+                        filename=full_path.name,
+                        content_type=content_type,
+                        file_data=file_data,
+                        file_size=file_size,
+                        checksum=hashlib.sha256(file_data).hexdigest(),
+                        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+                    )
+                    db_session.add(sandbox_file)
+
+                    from app.config import settings as app_settings
+                    base_url = app_settings.public_base_url
+                    filename_encoded = quote(full_path.name)
+                    download_url = f"{base_url}/dl/{file_id}/{filename_encoded}"
+
+                    is_image = ext in IMAGE_EXTENSIONS
+
+                    if file_size >= 1024 * 1024:
+                        size_human = f"{file_size / (1024 * 1024):.1f} MB"
+                    elif file_size >= 1024:
+                        size_human = f"{file_size / 1024:.1f} KB"
+                    else:
+                        size_human = f"{file_size} B"
+
+                    download_info.append({
+                        'filename': full_path.name,
+                        'url': download_url,
+                        'size': size_human,
+                        'file_id': file_id,
+                        'is_image': is_image,
+                    })
+
+                await db_session.commit()
 
         except Exception as e:
-            logger.error(f"File storage failed: {e}", exc_info=True)
+            logger.error(f"Postgres file storage failed: {e}", exc_info=True)
 
         return download_info
 
     async def execute(self, code: str, session_id: str = "default",
-                      timeout: int = None, context: Dict = None) -> ExecutionResult:
-        """Execute code in a persistent sandboxed namespace.
+                      timeout: int = None, context: Dict = None,
+                      sequence: Optional[int] = None) -> ExecutionResult:
+        """Execute code in a sandboxed environment with session persistence.
 
-        Acquires a per-session async lock so concurrent calls to the same
-        session_id queue up WITHOUT blocking the event loop. Health checks,
-        list_files, fetch_from_url, and other tools continue working.
+        Args:
+            code: Python code to execute
+            session_id: Session identifier for kernel persistence
+            timeout: Max execution time in seconds
+            context: Optional context dict
+            sequence: Optional step number for ordered execution (1, 2, 3...).
+                      When multiple calls arrive simultaneously with sequence numbers,
+                      they execute in order. 0 or None = no ordering (backward compatible).
         """
         result = ExecutionResult()
 
@@ -1037,54 +822,50 @@ class SandboxExecutor:
         session_dir = self.sandbox_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        # Async lock — queues concurrent calls WITHOUT blocking the event loop
+        # Normalize sequence: 0 or negative = no sequencing
+        effective_sequence = sequence if (sequence and sequence > 0) else None
+
+        sequencer = self._get_sequencer(session_id)
+
+        if effective_sequence is not None:
+            logger.info(f"execute: session={session_id}, sequence={effective_sequence}, waiting for turn")
+            await sequencer.wait_for_turn(effective_sequence, timeout=float(timeout))
+        else:
+            await sequencer.wait_for_batch_clear(timeout=30.0)
+
         async_lock = self._get_async_lock(session_id)
         async with async_lock:
-            return await self._execute_locked(
-                code, session_id, session_dir, timeout, result, context
-            )
+            logger.info(f"execute: session={session_id}, "
+                        f"sequence={effective_sequence or 'none'}, timeout={timeout}s")
+            try:
+                return await self._execute_locked(
+                    code, session_id, session_dir, timeout, result, context
+                )
+            finally:
+                if effective_sequence is not None:
+                    await sequencer.mark_completed(effective_sequence)
 
     async def _execute_locked(self, code: str, session_id: str, session_dir: Path,
                                timeout: int, result: ExecutionResult,
                                context: Dict = None) -> ExecutionResult:
-        """Execute code while holding the per-session async lock."""
+        """Core execution logic, called while holding the async lock."""
 
-        logger.info(f"execute: session={session_id}, timeout={timeout}s")
+        if kernel_manager.has_session(session_id):
+            sandbox_globals = kernel_manager.get_or_create(
+                session_id, {}, session_dir
+            )
+            logger.error(f"KERNEL_DIAG: REUSED session={session_id}, "
+                         f"user_vars={list(kernel_manager.get_session_info(session_id)['variables'].keys())}, "
+                         f"total_keys={len(sandbox_globals)}")
+        else:
+            sandbox_globals = self._build_safe_globals(session_dir)
+            sandbox_globals = kernel_manager.get_or_create(
+                session_id, sandbox_globals, session_dir
+            )
+            logger.error(f"KERNEL_DIAG: CREATED session={session_id}, "
+                         f"total_keys={len(sandbox_globals)}")
 
-        try:
-            existing_globals = kernel_manager.get_existing(session_id)
-            if existing_globals is not None:
-                sandbox_globals = existing_globals
-                user_vars = [k for k in sandbox_globals if not k.startswith('_') and k not in (
-                    'pd','pandas','np','numpy','json','csv','math','statistics','datetime',
-                    'collections','itertools','functools','re','io','copy','hashlib','base64',
-                    'Path','SANDBOX_DIR','RESULT','plt','matplotlib','sns','seaborn',
-                    'Dict','List','Optional','Tuple','Set','Any','timedelta','timezone','date',
-                    'Decimal','Fraction','dataclass','field','asdict',
-                )]
-                logger.error(f"KERNEL_DIAG: REUSED session={session_id}, "
-                             f"user_vars={user_vars[:10]}, total_keys={len(sandbox_globals)}")
-            else:
-                fresh_globals = self._build_safe_globals(session_dir)
-                sandbox_globals = kernel_manager.get_or_create(
-                    session_id=session_id,
-                    sandbox_globals=fresh_globals,
-                    session_dir=session_dir,
-                )
-                logger.error(f"KERNEL_DIAG: CREATED session={session_id}, "
-                             f"total_keys={len(sandbox_globals)}, "
-                             f"active_kernels={kernel_manager.active_count}")
-        except Exception as e:
-            result.success = False
-            result.error_message = f"Kernel initialization failed: {e}"
-            result.error_traceback = traceback.format_exc()
-            return result
-
-        sandbox_globals['RESULT'] = None
-        if context:
-            sandbox_globals.update(context)
-
-        sandbox_globals['_normalize_path'] = self._make_path_normalizer(session_dir)
+        sandbox_globals['__normalize_path'] = self._make_path_normalizer(session_dir)
         self._install_pandas_path_hooks(sandbox_globals, session_dir)
 
         try:
