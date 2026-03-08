@@ -206,6 +206,18 @@ class SandboxExecutor:
     def __init__(self, sandbox_dir: Path = None):
         self.sandbox_dir = sandbox_dir or settings.SANDBOX_DIR
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
+        self._async_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_async_lock(self, session_id: str) -> asyncio.Lock:
+        """Get a per-session async lock. Non-blocking to the event loop.
+
+        When SimTheory fires multiple execute_code calls simultaneously,
+        they queue up on this lock WITHOUT blocking health checks,
+        list_files, fetch_from_url, or other MCP tools.
+        """
+        if session_id not in self._async_locks:
+            self._async_locks[session_id] = asyncio.Lock()
+        return self._async_locks[session_id]
 
     def _get_safe_builtins(self) -> Dict:
         safe = {}
@@ -1011,8 +1023,9 @@ class SandboxExecutor:
                       timeout: int = None, context: Dict = None) -> ExecutionResult:
         """Execute code in a persistent sandboxed namespace.
 
-        Acquires a per-session lock so concurrent calls to the same
-        session_id queue up instead of racing.
+        Acquires a per-session async lock so concurrent calls to the same
+        session_id queue up WITHOUT blocking the event loop. Health checks,
+        list_files, fetch_from_url, and other tools continue working.
         """
         result = ExecutionResult()
 
@@ -1024,20 +1037,17 @@ class SandboxExecutor:
         session_dir = self.sandbox_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        # Serialize concurrent calls to the same session
-        exec_lock = kernel_manager.get_exec_lock(session_id)
-        exec_lock.acquire()
-        try:
+        # Async lock — queues concurrent calls WITHOUT blocking the event loop
+        async_lock = self._get_async_lock(session_id)
+        async with async_lock:
             return await self._execute_locked(
                 code, session_id, session_dir, timeout, result, context
             )
-        finally:
-            exec_lock.release()
 
     async def _execute_locked(self, code: str, session_id: str, session_dir: Path,
                                timeout: int, result: ExecutionResult,
                                context: Dict = None) -> ExecutionResult:
-        """Execute code while holding the per-session lock."""
+        """Execute code while holding the per-session async lock."""
 
         logger.info(f"execute: session={session_id}, timeout={timeout}s")
 
