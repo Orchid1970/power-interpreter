@@ -743,7 +743,7 @@ class SandboxExecutor:
                     file_size = len(file_data)
                     file_id = str(uuid.uuid4())
 
-                    content_type_map = {
+                    mime_type_map = {
                         '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
                         '.svg': 'image/svg+xml', '.pdf': 'application/pdf',
                         '.csv': 'text/csv', '.json': 'application/json',
@@ -755,15 +755,15 @@ class SandboxExecutor:
                         '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                         '.doc': 'application/msword',
                     }
-                    content_type = content_type_map.get(ext, 'application/octet-stream')
+                    mime_type = mime_type_map.get(ext, 'application/octet-stream')
 
                     sandbox_file = SandboxFile(
                         id=file_id,
                         session_id=session_id,
                         filename=full_path.name,
-                        content_type=content_type,
-                        file_data=file_data,
+                        mime_type=mime_type,
                         file_size=file_size,
+                        content=file_data,
                         checksum=hashlib.sha256(file_data).hexdigest(),
                         expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
                     )
