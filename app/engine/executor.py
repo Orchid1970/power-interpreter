@@ -46,6 +46,25 @@ MATPLOTLIB_USE_PATTERN = re_module.compile(
     re_module.MULTILINE
 )
 
+# Deprecated pandas frequency aliases (pandas 2.x)
+# LLMs frequently generate the old aliases which raise ValueError at runtime
+DEPRECATED_FREQ_ALIASES = {
+    'M': 'ME',    # Month end
+    'Y': 'YE',    # Year end
+    'A': 'YE',    # Annual (old alias for year end)
+    'Q': 'QE',    # Quarter end
+    'H': 'h',     # Hour (case change)
+    'T': 'min',   # Minute
+    'S': 's',     # Second (case change)
+    'L': 'ms',    # Millisecond
+    'U': 'us',    # Microsecond
+    'N': 'ns',    # Nanosecond
+    'BM': 'BME',  # Business month end
+    'BY': 'BYE',  # Business year end
+    'BQ': 'BQE',  # Business quarter end
+    'BA': 'BYE',  # Business annual
+}
+
 REDIRECT_PATH_PREFIXES = ('/tmp/', '/temp/', '/var/tmp/')
 
 ALLOWED_READ_PATHS = [
@@ -269,6 +288,7 @@ class SessionSequencer:
                 )
             except asyncio.TimeoutError:
                 logger.warning("Non-sequenced call timed out waiting for batch. Proceeding.")
+
                 
 class SandboxExecutor:
     def __init__(self, sandbox_dir: Path = None):
@@ -579,6 +599,79 @@ class SandboxExecutor:
         })
 
         return sandbox_globals
+
+    def _patch_common_llm_mistakes(self, code: str) -> str:
+        """Fix common LLM code-generation errors before execution.
+
+        Catches known patterns where LLMs generate deprecated or incorrect
+        Python code, and silently corrects them to working equivalents.
+
+        Currently handles:
+          - pandas 2.x deprecated frequency aliases (freq='M' → freq='ME', etc.)
+          - urllib.request.request() → urllib.request.urlopen()
+        """
+        patched = code
+
+        # --- Issue 5: pandas deprecated freq aliases (pandas 2.x) -----------
+        # Matches: freq='M', freq="M", freq = 'Q', etc.
+        def _fix_freq_arg(m):
+            prefix = m.group(1)   # 'freq=' with optional whitespace
+            quote_char = m.group(2)    # quote character (' or ")
+            alias = m.group(3)    # the frequency alias
+            if alias in DEPRECATED_FREQ_ALIASES:
+                replacement = DEPRECATED_FREQ_ALIASES[alias]
+                logger.debug(f"LLM patch: freq='{alias}' → freq='{replacement}'")
+                return f"{prefix}{quote_char}{replacement}{quote_char}"
+            return m.group(0)
+
+        patched = re_module.sub(
+            r"""(freq\s*=\s*)(['"])([A-Z]{1,2})\2""",
+            _fix_freq_arg,
+            patched
+        )
+
+        # Matches: .resample('M'), .resample("Q"), etc.
+        def _fix_resample_arg(m):
+            prefix = m.group(1)        # '.resample('
+            quote_char = m.group(2)    # quote character
+            alias = m.group(3)         # the frequency alias
+            suffix = m.group(4)        # closing paren area
+            if alias in DEPRECATED_FREQ_ALIASES:
+                replacement = DEPRECATED_FREQ_ALIASES[alias]
+                logger.debug(f"LLM patch: resample('{alias}') → resample('{replacement}')")
+                return f"{prefix}{quote_char}{replacement}{quote_char}{suffix}"
+            return m.group(0)
+
+        patched = re_module.sub(
+            r"""(\.resample\(\s*)(['"])([A-Z]{1,2})\2(\s*\))""",
+            _fix_resample_arg,
+            patched
+        )
+
+        # Matches: .asfreq('M'), .asfreq("Q"), etc.
+        def _fix_asfreq_arg(m):
+            prefix = m.group(1)
+            quote_char = m.group(2)
+            alias = m.group(3)
+            suffix = m.group(4)
+            if alias in DEPRECATED_FREQ_ALIASES:
+                replacement = DEPRECATED_FREQ_ALIASES[alias]
+                logger.debug(f"LLM patch: asfreq('{alias}') → asfreq('{replacement}')")
+                return f"{prefix}{quote_char}{replacement}{quote_char}{suffix}"
+            return m.group(0)
+
+        patched = re_module.sub(
+            r"""(\.asfreq\(\s*)(['"])([A-Z]{1,2})\2(\s*\))""",
+            _fix_asfreq_arg,
+            patched
+        )
+
+        # --- Issue 6: urllib.request.request() → urllib.request.urlopen() ----
+        if 'urllib.request.request(' in patched:
+            patched = patched.replace('urllib.request.request(', 'urllib.request.urlopen(')
+            logger.debug("LLM patch: urllib.request.request() → urllib.request.urlopen()")
+
+        return patched
 
     def _preprocess_code(self, code: str, sandbox_globals: Dict) -> str:
         code = MATPLOTLIB_USE_PATTERN.sub('# matplotlib.use() handled by sandbox', code)
@@ -893,6 +986,7 @@ class SandboxExecutor:
         self._install_pandas_path_hooks(sandbox_globals, session_dir)
 
         try:
+            code = self._patch_common_llm_mistakes(code)
             processed_code = self._preprocess_code(code, sandbox_globals)
         except Exception as e:
             result.success = False
