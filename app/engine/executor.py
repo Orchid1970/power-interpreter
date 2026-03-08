@@ -211,8 +211,12 @@ class SandboxExecutor:
         safe = {}
         import builtins as builtins_module
 
+        # NOTE: __import__ is intentionally NOT blocked.
+        # It's needed by libraries that do internal imports (matplotlib, openpyxl, etc.)
+        # Security is enforced by _preprocess_code() which rewrites user import statements,
+        # and by _lazy_import() which controls which top-level modules are available.
         blocked = set(settings.BLOCKED_BUILTINS) if hasattr(settings, 'BLOCKED_BUILTINS') else {
-            'eval', 'exec', 'compile', '__import__', 'globals', 'locals',
+            'eval', 'exec', 'compile', 'globals', 'locals',
             'exit', 'quit', 'breakpoint', 'input',
         }
 
@@ -225,6 +229,10 @@ class SandboxExecutor:
                 safe[name] = getattr(builtins_module, name)
             except AttributeError:
                 pass
+
+        # Explicitly include __import__ and __build_class__ (needed by exec'd code)
+        safe['__import__'] = __import__
+        safe['__build_class__'] = getattr(builtins_module, '__build_class__', None)
 
         safe['True'] = True
         safe['False'] = False
