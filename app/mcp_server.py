@@ -1,22 +1,5 @@
-"""Power Interpreter MCP - MCP Server Definition
-
-Defines the MCP tools that SimTheory.ai can call.
-This maps MCP tool calls to the FastAPI endpoints.
-
-MCP Tools (34):
-  12 core tools (execute, files, jobs, datasets, sessions)
-  22 Microsoft 365 tools (OneDrive + SharePoint)
-
-Version: 2.9.1 -- version alignment + kernel persistence patches
-
-HISTORY:
-  v2.8.6: Version unification across all files.
-  v2.9.0: Trimmed all 34 tool descriptions to reduce token overhead.
-           ~57% reduction in tool context tokens per message.
-           No logic changes -- only docstrings modified.
-  v2.9.1: Version alignment across all modules. Smart error handling
-           for empty execute_code args. Kernel persistence patches.
-           Fixed MS tool count log (21->22).
+"""Power Interpreter MCP Server - Tool definitions for SimTheory.ai
+Version: 2.9.2
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -30,35 +13,19 @@ import re
 
 logger = logging.getLogger(__name__)
 
-# MCP Server
 mcp = FastMCP("Power Interpreter")
-
-# Microsoft integration (initialized after base tools -- see bottom of file)
 _ms_auth, _ms_graph = None, None
 
-# Internal API base URL
-_default_base = "http://127.0.0.1:8080"
-API_BASE = os.getenv("API_BASE_URL", _default_base)
+API_BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8080")
 API_KEY = os.getenv("API_KEY", "")
-
-# Max image size to base64 encode (5MB)
 MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
 
-# Regex to find /dl/{uuid}/{filename} image URLs in stdout
 _DL_IMAGE_URL_RE = re.compile(
     r'(https?://[^\s\)]+/dl/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([^\s\)\]]+\.(?:png|jpg|jpeg|svg|gif)))',
     re.IGNORECASE
 )
-
-# Regex to strip markdown image syntax from stdout
-_MARKDOWN_IMAGE_RE = re.compile(
-    r'!\[[^\]]*\]\([^\)]*\.(?:png|jpg|jpeg|svg|gif)\)',
-    re.IGNORECASE
-)
-_GENERATED_CHARTS_RE = re.compile(
-    r'Generated charts?:\s*\n*',
-    re.IGNORECASE
-)
+_MARKDOWN_IMAGE_RE = re.compile(r'!\[[^\]]*\]\([^\)]*\.(?:png|jpg|jpeg|svg|gif)\)', re.IGNORECASE)
+_GENERATED_CHARTS_RE = re.compile(r'Generated charts?:\s*\n*', re.IGNORECASE)
 
 logger.info(f"MCP Server: API_BASE={API_BASE}")
 logger.info(f"MCP Server: API_KEY={'***configured***' if API_KEY else 'NOT SET'}")
@@ -73,63 +40,43 @@ def _headers():
 # ============================================================
 
 async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
-    """Fetch image bytes from internal /dl/ route, return MCP ImageContent block."""
     from urllib.parse import quote
-    encoded_filename = quote(filename)
-    internal_url = f"{API_BASE}/dl/{file_id}/{encoded_filename}"
-
+    internal_url = f"{API_BASE}/dl/{file_id}/{quote(filename)}"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(internal_url)
-
-            if resp.status_code != 200:
-                logger.warning(f"Image fetch failed: {internal_url} -> HTTP {resp.status_code}")
+            if resp.status_code != 200 or len(resp.content) > MAX_IMAGE_BASE64_BYTES:
                 return None
 
-            if len(resp.content) > MAX_IMAGE_BASE64_BYTES:
-                logger.warning(f"Image too large for base64: {filename} ({len(resp.content)} bytes)")
-                return None
-
-            content_type = resp.headers.get('content-type', '')
-            if 'png' in content_type or filename.lower().endswith('.png'):
+            ct = resp.headers.get('content-type', '')
+            if 'png' in ct or filename.lower().endswith('.png'):
                 mime = 'image/png'
-            elif 'jpeg' in content_type or 'jpg' in content_type:
+            elif 'jpeg' in ct or 'jpg' in ct:
                 mime = 'image/jpeg'
-            elif 'svg' in content_type:
+            elif 'svg' in ct:
                 mime = 'image/svg+xml'
             else:
-                mime = content_type.split(';')[0].strip() or 'image/png'
+                mime = ct.split(';')[0].strip() or 'image/png'
 
             b64 = base64.b64encode(resp.content).decode('utf-8')
-            logger.info(f"Image base64 encoded: {filename} ({len(resp.content)} bytes -> {len(b64)} chars, {mime})")
-
+            logger.info(f"Image encoded: {filename} ({len(resp.content)}B -> {len(b64)}ch, {mime})")
             return {"type": "image", "data": b64, "mimeType": mime}
-
     except Exception as e:
-        logger.warning(f"Image base64 fetch failed for {filename}: {e}")
+        logger.warning(f"Image fetch failed for {filename}: {e}")
         return None
 
 
 def _extract_image_urls_from_stdout(stdout: str) -> List[Tuple[str, str, str]]:
-    """Extract /dl/{uuid}/{filename} image URLs from stdout text."""
-    matches = _DL_IMAGE_URL_RE.findall(stdout)
-    if matches:
-        logger.info(f"Found {len(matches)} image URL(s) in stdout via regex")
-        for full_url, file_id, filename in matches:
-            logger.info(f"  -> file_id={file_id}, filename={filename}")
-    return matches
+    return _DL_IMAGE_URL_RE.findall(stdout)
 
 
 def _strip_image_markdown_from_text(text: str) -> str:
-    """Remove markdown image syntax and 'Generated charts:' prefix from text."""
     cleaned = _MARKDOWN_IMAGE_RE.sub('', text)
     cleaned = _GENERATED_CHARTS_RE.sub('', cleaned)
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-    return cleaned
+    return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
 
 async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
-    """Replace text-based image URLs with native MCP ImageContent blocks."""
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
@@ -143,22 +90,14 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
     fallback_blocks = []
     images_found = False
 
-    # PATH A: Use inline_images[] + download_urls[]
+    # Path A: inline_images from JSON
     if inline_images:
-        logger.info(f"Path A: {len(inline_images)} inline_images in JSON")
         images_found = True
-
-        file_id_map = {}
-        for dl in download_urls:
-            if dl.get('is_image'):
-                file_id_map[dl.get('filename', '')] = {
-                    'file_id': dl.get('file_id', ''),
-                    'url': dl.get('url', ''),
-                }
+        file_id_map = {dl['filename']: {'file_id': dl.get('file_id', ''), 'url': dl.get('url', '')}
+                       for dl in download_urls if dl.get('is_image')}
 
         for img in inline_images:
             filename = img.get('filename', '')
-            alt_text = img.get('alt_text', 'Generated chart')
             dl_info = file_id_map.get(filename, {})
             file_id = dl_info.get('file_id', '')
             public_url = dl_info.get('url', '') or img.get('url', '')
@@ -167,68 +106,37 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                 block = await _fetch_image_base64(file_id, filename)
                 if block:
                     image_blocks.append(block)
-                    logger.info(f"Path A: image block created for {filename}")
                     continue
-
             if public_url:
-                fallback_blocks.append({
-                    "type": "text",
-                    "text": f"Chart: {alt_text}\nImage URL: {public_url}"
-                })
-                logger.warning(f"Path A: falling back to text URL for {filename}")
+                fallback_blocks.append({"type": "text", "text": f"Chart: {img.get('alt_text', filename)}\nURL: {public_url}"})
 
-    # PATH B: Scan stdout for /dl/ URLs (RELIABLE path)
+    # Path B: scan stdout for /dl/ URLs
     if not images_found and stdout:
         url_matches = _extract_image_urls_from_stdout(stdout)
-
         if url_matches:
             images_found = True
-            logger.info(f"Path B: found {len(url_matches)} image URL(s) in stdout")
-
             for full_url, file_id, filename in url_matches:
                 block = await _fetch_image_base64(file_id, filename)
                 if block:
                     image_blocks.append(block)
-                    logger.info(f"Path B: image block created for {filename}")
                 else:
-                    fallback_blocks.append({
-                        "type": "text",
-                        "text": f"Chart: {filename}\nImage URL: {full_url}"
-                    })
-                    logger.warning(f"Path B: base64 fetch failed, text fallback for {filename}")
+                    fallback_blocks.append({"type": "text", "text": f"Chart: {filename}\nURL: {full_url}"})
 
-    # STRIP markdown image syntax from stdout text block
+    # Strip markdown image syntax from text blocks
     if image_blocks and blocks:
         for i, block in enumerate(blocks):
             if block.get('type') == 'text':
-                original_text = block['text']
-                cleaned_text = _strip_image_markdown_from_text(original_text)
-                if cleaned_text != original_text:
-                    if cleaned_text:
-                        blocks[i] = {"type": "text", "text": cleaned_text}
-                        logger.info(f"Stripped image markdown from text block {i}")
-                    else:
-                        blocks[i] = None
-                        logger.info(f"Removed empty text block {i} after stripping")
+                cleaned = _strip_image_markdown_from_text(block['text'])
+                if cleaned != block['text']:
+                    blocks[i] = {"type": "text", "text": cleaned} if cleaned else None
                 break
-
         blocks = [b for b in blocks if b is not None]
 
-    # INSERT image blocks into response
+    # Insert image blocks after first text block
     if image_blocks or fallback_blocks:
-        insert_pos = 0
-        for i, block in enumerate(blocks):
-            if block.get('type') == 'text':
-                insert_pos = i + 1
-                break
-
+        insert_pos = next((i + 1 for i, b in enumerate(blocks) if b.get('type') == 'text'), 0)
         for j, block in enumerate(image_blocks + fallback_blocks):
             blocks.insert(insert_pos + j, block)
-
-        logger.info(
-            f"Enriched response: {len(image_blocks)} image blocks, "
-            f"{len(fallback_blocks)} fallback blocks"
-        )
 
     return blocks
 
@@ -238,7 +146,6 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
 # ============================================================
 
 def _build_content_blocks(resp_text: str) -> list:
-    """Build MCP content blocks from execute_code API response."""
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
@@ -246,425 +153,202 @@ def _build_content_blocks(resp_text: str) -> list:
 
     blocks = []
 
-    # Block 1: stdout
     stdout = data.get('stdout', '').strip()
     if stdout:
         blocks.append({"type": "text", "text": stdout})
 
-    # Block 2: Error information
     if not data.get('success', False):
         error_msg = data.get('error_message', 'Unknown error')
         error_tb = data.get('error_traceback', '')
         error_text = f"Execution Error: {error_msg}"
         if error_tb:
-            if len(error_tb) > 500:
-                error_tb = "..." + error_tb[-500:]
-            error_text += f"\n\nTraceback:\n{error_tb}"
+            error_text += f"\n\nTraceback:\n{'...' + error_tb[-500:] if len(error_tb) > 500 else error_tb}"
         blocks.append({"type": "text", "text": error_text})
 
-    # Block 3: Non-image download links
-    download_urls = data.get('download_urls', [])
-    non_image_downloads = [d for d in download_urls if not d.get('is_image', False)]
-    for info in non_image_downloads:
-        filename = info.get('filename', 'file')
-        url = info.get('url', '')
-        size = info.get('size', '')
-        if url:
-            blocks.append({"type": "text", "text": f"File: {filename} ({size})\nDownload URL: {url}"})
+    for info in data.get('download_urls', []):
+        if not info.get('is_image', False) and info.get('url'):
+            blocks.append({"type": "text", "text": f"File: {info.get('filename', 'file')} ({info.get('size', '')})\nDownload: {info['url']}"})
 
-    # Block 4: Metadata
     meta_parts = []
-    exec_time = data.get('execution_time_ms', 0)
-    if exec_time:
-        meta_parts.append(f"Execution: {exec_time}ms")
-    kernel_info = data.get('kernel_info', {})
-    if kernel_info.get('session_persisted'):
-        var_count = kernel_info.get('variable_count', 0)
-        exec_count = kernel_info.get('execution_count', 0)
-        meta_parts.append(f"Session: {var_count} variables persisted (call #{exec_count})")
+    if data.get('execution_time_ms'):
+        meta_parts.append(f"Execution: {data['execution_time_ms']}ms")
+    ki = data.get('kernel_info', {})
+    if ki.get('session_persisted'):
+        meta_parts.append(f"Session: {ki.get('variable_count', 0)} vars (call #{ki.get('execution_count', 0)})")
     if meta_parts:
         blocks.append({"type": "text", "text": " | ".join(meta_parts)})
 
-    if not blocks:
-        blocks.append({"type": "text", "text": "Code executed successfully (no output)."})
-
-    logger.info(f"Built {len(blocks)} content blocks for MCP response")
-    return blocks
+    return blocks or [{"type": "text", "text": "Code executed successfully (no output)."}]
 
 
 # ============================================================
-# CODE EXECUTION TOOLS
+# TOOLS
 # ============================================================
 
 @mcp.tool()
-async def execute_code(
-    code: str,
-    session_id: str = "default",
-    timeout: int = 55
-) -> list:
-    """Execute Python in a persistent sandbox. Variables, imports, and files persist across calls. Charts auto-captured as inline images.
-
-    Args:
-        code: Python code to execute.
-        session_id: Session ID for state persistence.
-        timeout: Max seconds (default 55).
-    """
-    url = f"{API_BASE}/api/execute"
-    logger.info(f"execute_code: POST {url} session={session_id}")
+async def execute_code(code: str, session_id: str = "default", timeout: int = 55) -> list:
+    """Execute Python in a persistent sandbox. Variables, imports, and files persist. Charts auto-captured."""
     try:
         async with httpx.AsyncClient(timeout=timeout + 5) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"code": code, "session_id": session_id, "timeout": timeout}
-            )
-
+            resp = await client.post(f"{API_BASE}/api/execute", headers=_headers(),
+                                     json={"code": code, "session_id": session_id, "timeout": timeout})
             blocks = _build_content_blocks(resp.text)
-            blocks = await _enrich_blocks_with_images(blocks, resp.text)
-            return blocks
-
+            return await _enrich_blocks_with_images(blocks, resp.text)
     except Exception as e:
-        logger.error(f"execute_code: error: {e}", exc_info=True)
-        return [{"type": "text", "text": f"Error calling execute_code API: {e}"}]
+        return [{"type": "text", "text": f"execute_code error: {e}"}]
 
-
-# ============================================================
-# FILE TOOLS
-# ============================================================
 
 @mcp.tool()
-async def fetch_from_url(
-    url: str,
-    filename: Optional[str] = None,
-    session_id: str = "default",
-) -> list:
-    """Download a file from any HTTPS URL into the sandbox for use with execute_code.
-
-    Args:
-        url: HTTPS URL to download from.
-        filename: Name to save as in sandbox. Derived from URL if omitted.
-        session_id: Session for file isolation.
-    """
+async def fetch_from_url(url: str, filename: Optional[str] = None, session_id: str = "default") -> list:
+    """Download a file from any URL into the sandbox."""
     if not filename:
         from urllib.parse import urlparse
-        parsed = urlparse(url)
-        filename = parsed.path.split('/')[-1].split('?')[0] or 'downloaded_file'
-
-    api_url = f"{API_BASE}/api/files/fetch"
-    logger.info(f"fetch_from_url: POST {api_url} url={url[:80]} filename={filename}")
-
+        filename = urlparse(url).path.split('/')[-1].split('?')[0] or 'downloaded_file'
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                api_url,
-                headers=_headers(),
-                json={"url": url, "filename": filename, "session_id": session_id}
-            )
-            logger.info(f"fetch_from_url: response status={resp.status_code}")
+            resp = await client.post(f"{API_BASE}/api/files/fetch", headers=_headers(),
+                                     json={"url": url, "filename": filename, "session_id": session_id})
             if resp.status_code == 200:
-                data = resp.json()
-                return [{
-                    "type": "text",
-                    "text": (
-                        f"File fetched successfully!\n"
-                        f"  Filename : {data.get('filename')}\n"
-                        f"  Size     : {data.get('size_human')}\n"
-                        f"  Path     : {data.get('path')}\n"
-                        f"  Session  : {data.get('session_id')}\n"
-                        f"  Preview  : {data.get('preview', 'N/A')}\n\n"
-                        f"Now call execute_code to work with this file."
-                    )
-                }]
-            else:
-                return [{"type": "text", "text": f"fetch_from_url failed (HTTP {resp.status_code}):\n  {resp.text[:300]}"}]
+                d = resp.json()
+                return [{"type": "text", "text": f"Fetched: {d.get('filename')} ({d.get('size_human')}) -> {d.get('path')}"}]
+            return [{"type": "text", "text": f"fetch_from_url failed (HTTP {resp.status_code}): {resp.text[:300]}"}]
     except Exception as e:
-        logger.error(f"fetch_from_url: error: {e}", exc_info=True)
         return [{"type": "text", "text": f"fetch_from_url error: {e}"}]
 
 
 @mcp.tool()
-async def upload_file(
-    filename: str,
-    content_base64: str,
-    session_id: str = "default"
-) -> str:
-    """Upload a base64-encoded file to the sandbox. For URL-accessible files, use fetch_from_url instead.
-
-    Args:
-        filename: Name to save as (e.g. 'data.csv').
-        content_base64: Base64-encoded file content.
-        session_id: Session for isolation.
-    """
-    url = f"{API_BASE}/api/files/upload"
-    logger.info(f"upload_file: POST {url} filename={filename}")
+async def upload_file(filename: str, content_base64: str, session_id: str = "default") -> str:
+    """Upload a base64-encoded file to the sandbox."""
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"filename": filename, "content_base64": content_base64,
-                      "session_id": session_id}
-            )
+            resp = await client.post(f"{API_BASE}/api/files/upload", headers=_headers(),
+                                     json={"filename": filename, "content_base64": content_base64, "session_id": session_id})
             return resp.text
     except Exception as e:
-        logger.error(f"upload_file: error: {e}", exc_info=True)
-        return f"Error calling upload_file API: {e}"
+        return f"upload_file error: {e}"
 
 
 @mcp.tool()
-async def fetch_file(
-    url: str,
-    filename: str,
-    session_id: str = "default"
-) -> str:
-    """Download a file from a URL into the sandbox. Alias for fetch_from_url.
-
-    Args:
-        url: URL to download from.
-        filename: Name to save as in sandbox.
-        session_id: Session for isolation.
-    """
-    api_url = f"{API_BASE}/api/files/fetch"
-    logger.info(f"fetch_file: POST {api_url}")
+async def fetch_file(url: str, filename: str, session_id: str = "default") -> str:
+    """Download a file from a URL into the sandbox. Alias for fetch_from_url."""
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                api_url,
-                headers=_headers(),
-                json={"url": url, "filename": filename, "session_id": session_id}
-            )
+            resp = await client.post(f"{API_BASE}/api/files/fetch", headers=_headers(),
+                                     json={"url": url, "filename": filename, "session_id": session_id})
             return resp.text
     except Exception as e:
-        logger.error(f"fetch_file: error: {e}", exc_info=True)
-        return f"Error calling fetch_file API: {e}"
+        return f"fetch_file error: {e}"
 
 
 @mcp.tool()
 async def list_files(session_id: Optional[str] = "default") -> str:
-    """List files in the sandbox with size and type info.
-
-    Args:
-        session_id: Session to list files for.
-    """
-    url = f"{API_BASE}/api/files"
-    logger.info(f"list_files: GET {url}")
+    """List files in the sandbox."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                url,
-                headers=_headers(),
-                params={"session_id": session_id}
-            )
+            resp = await client.get(f"{API_BASE}/api/files", headers=_headers(), params={"session_id": session_id})
             return resp.text
     except Exception as e:
-        logger.error(f"list_files: error: {e}", exc_info=True)
-        return f"Error calling list_files API: {e}"
+        return f"list_files error: {e}"
 
-
-# ============================================================
-# ASYNC JOB TOOLS
-# ============================================================
 
 @mcp.tool()
-async def submit_job(
-    code: str,
-    session_id: str = "default",
-    timeout: int = 600
-) -> str:
-    """Submit a long-running job for async execution (up to 30 min). Returns job_id. Poll with get_job_status, retrieve with get_job_result.
-
-    Args:
-        code: Python code to execute.
-        session_id: Session for state persistence.
-        timeout: Max seconds (default 600).
-    """
-    url = f"{API_BASE}/api/jobs/submit"
-    logger.info(f"submit_job: POST {url}")
+async def submit_job(code: str, session_id: str = "default", timeout: int = 600) -> str:
+    """Submit a long-running job (up to 30 min). Returns job_id."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"code": code, "session_id": session_id, "timeout": timeout}
-            )
+            resp = await client.post(f"{API_BASE}/api/jobs/submit", headers=_headers(),
+                                     json={"code": code, "session_id": session_id, "timeout": timeout})
             return resp.text
     except Exception as e:
-        logger.error(f"submit_job: error: {e}", exc_info=True)
-        return f"Error calling submit_job API: {e}"
+        return f"submit_job error: {e}"
 
 
 @mcp.tool()
 async def get_job_status(job_id: str) -> str:
-    """Check async job status. Values: pending, running, completed, failed, cancelled, timeout.
-
-    Args:
-        job_id: The job ID from submit_job.
-    """
-    url = f"{API_BASE}/api/jobs/{job_id}/status"
-    logger.info(f"get_job_status: GET {url}")
+    """Check async job status."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=_headers())
+            resp = await client.get(f"{API_BASE}/api/jobs/{job_id}/status", headers=_headers())
             return resp.text
     except Exception as e:
-        logger.error(f"get_job_status: error: {e}", exc_info=True)
-        return f"Error calling get_job_status API: {e}"
+        return f"get_job_status error: {e}"
 
 
 @mcp.tool()
 async def get_job_result(job_id: str) -> list:
-    """Get the full result of a completed job.
-
-    Args:
-        job_id: The job ID from submit_job.
-    """
-    url = f"{API_BASE}/api/jobs/{job_id}/result"
-    logger.info(f"get_job_result: GET {url}")
+    """Get the full result of a completed job."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url, headers=_headers())
-
+            resp = await client.get(f"{API_BASE}/api/jobs/{job_id}/result", headers=_headers())
             blocks = _build_content_blocks(resp.text)
-            blocks = await _enrich_blocks_with_images(blocks, resp.text)
-            return blocks
-
+            return await _enrich_blocks_with_images(blocks, resp.text)
     except Exception as e:
-        logger.error(f"get_job_result: error: {e}", exc_info=True)
-        return f"Error calling get_job_result API: {e}"
+        return [{"type": "text", "text": f"get_job_result error: {e}"}]
 
-
-# ============================================================
-# DATASET TOOLS
-# ============================================================
 
 @mcp.tool()
-async def load_dataset(
-    file_path: str,
-    dataset_name: str,
-    session_id: str = "default",
-    delimiter: str = ","
-) -> str:
-    """Load a file from sandbox into PostgreSQL for SQL querying. Auto-detects format: CSV, Excel, PDF, JSON, Parquet. Handles 1.5M+ rows. Query with query_dataset after loading.
-
-    Args:
-        file_path: Filename in sandbox (e.g. 'data.xlsx').
-        dataset_name: Logical name for SQL queries (e.g. 'sales').
-        session_id: Session for file isolation.
-        delimiter: CSV delimiter (default comma).
-    """
-    url = f"{API_BASE}/api/data/load-csv"
-    logger.info(f"load_dataset: POST {url}")
+async def load_dataset(file_path: str, dataset_name: str, session_id: str = "default", delimiter: str = ",") -> str:
+    """Load a file into PostgreSQL for SQL querying. Auto-detects CSV, Excel, PDF, JSON, Parquet."""
     try:
         async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"file_path": file_path, "dataset_name": dataset_name,
-                      "session_id": session_id, "delimiter": delimiter}
-            )
+            resp = await client.post(f"{API_BASE}/api/data/load-csv", headers=_headers(),
+                                     json={"file_path": file_path, "dataset_name": dataset_name,
+                                           "session_id": session_id, "delimiter": delimiter})
             return resp.text
     except Exception as e:
-        logger.error(f"load_dataset: error: {e}", exc_info=True)
-        return f"Error calling load_dataset API: {e}"
+        return f"load_dataset error: {e}"
 
 
 @mcp.tool()
-async def query_dataset(
-    sql: str,
-    limit: int = 1000,
-    offset: int = 0
-) -> str:
-    """Execute a SQL query against datasets loaded into PostgreSQL.
-
-    Args:
-        sql: SQL SELECT query.
-        limit: Max rows returned (default 1000).
-        offset: Row offset for pagination.
-    """
-    url = f"{API_BASE}/api/data/query"
-    logger.info(f"query_dataset: POST {url}")
+async def query_dataset(sql: str, limit: int = 1000, offset: int = 0) -> str:
+    """Execute SQL against loaded datasets."""
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"sql": sql, "limit": limit, "offset": offset}
-            )
+            resp = await client.post(f"{API_BASE}/api/data/query", headers=_headers(),
+                                     json={"sql": sql, "limit": limit, "offset": offset})
             return resp.text
     except Exception as e:
-        logger.error(f"query_dataset: error: {e}", exc_info=True)
-        return f"Error calling query_dataset API: {e}"
+        return f"query_dataset error: {e}"
 
 
 @mcp.tool()
 async def list_datasets(session_id: str = None) -> str:
-    """List all datasets loaded into PostgreSQL.
-
-    Args:
-        session_id: Optional session filter.
-    """
-    params = {}
-    if session_id:
-        params["session_id"] = session_id
-    url = f"{API_BASE}/api/data/datasets"
-    logger.info(f"list_datasets: GET {url}")
+    """List all datasets loaded into PostgreSQL."""
     try:
+        params = {"session_id": session_id} if session_id else {}
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=_headers(), params=params)
+            resp = await client.get(f"{API_BASE}/api/data/datasets", headers=_headers(), params=params)
             return resp.text
     except Exception as e:
-        logger.error(f"list_datasets: error: {e}", exc_info=True)
-        return f"Error calling list_datasets API: {e}"
+        return f"list_datasets error: {e}"
 
-
-# ============================================================
-# SESSION TOOLS
-# ============================================================
 
 @mcp.tool()
-async def create_session(
-    name: str,
-    description: str = ""
-) -> str:
-    """Create an isolated workspace session. The \"default\" session is used automatically.
-
-    Args:
-        name: Session name (e.g. 'financial-model').
-        description: Optional description.
-    """
-    url = f"{API_BASE}/api/sessions"
-    logger.info(f"create_session: POST {url}")
+async def create_session(name: str, description: str = "") -> str:
+    """Create an isolated workspace session."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"name": name, "description": description}
-            )
+            resp = await client.post(f"{API_BASE}/api/sessions", headers=_headers(),
+                                     json={"name": name, "description": description})
             return resp.text
     except Exception as e:
-        logger.error(f"create_session: error: {e}", exc_info=True)
-        return f"Error calling create_session API: {e}"
+        return f"create_session error: {e}"
 
 
 # ============================================================
 # MICROSOFT 365 INTEGRATION
-# ============================================================
-# Registered AFTER all 12 base tools so a Microsoft failure
-# can never prevent the core tools from loading.
 # ============================================================
 
 try:
     from app.microsoft.bootstrap import init_microsoft_tools
     _ms_auth, _ms_graph = init_microsoft_tools(mcp)
     if _ms_auth:
-        logger.info("Microsoft OneDrive + SharePoint integration: ENABLED (22 additional tools)")
+        logger.info("Microsoft 365: ENABLED (22 tools)")
     else:
-        logger.info("Microsoft OneDrive + SharePoint integration: SKIPPED (no Azure credentials)")
+        logger.info("Microsoft 365: SKIPPED (no Azure credentials)")
 except ImportError:
-    logger.info("Microsoft integration module not found -- running with 12 base tools only")
+    logger.info("Microsoft module not found -- 12 base tools only")
     _ms_auth, _ms_graph = None, None
 except Exception as e:
-    logger.error(f"Microsoft integration failed to initialize: {e}", exc_info=True)
-    logger.info("Continuing with 12 base tools -- Microsoft tools unavailable")
+    logger.error(f"Microsoft init failed: {e}", exc_info=True)
     _ms_auth, _ms_graph = None, None
