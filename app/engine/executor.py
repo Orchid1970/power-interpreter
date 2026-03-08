@@ -520,8 +520,9 @@ class SandboxExecutor:
                 import requests
                 return requests
             else:
-                return __import__(module_name)
-        except ImportError as e:
+                import importlib
+                return importlib.import_module(module_name)
+        except ImportError as e:            
             logger.warning(f"Module {module_name} not available: {e}")
             return None
 
@@ -663,14 +664,29 @@ class SandboxExecutor:
                     sandbox_globals[alias] = getattr(mod, name)
                     assignments.append(f"{alias} = {alias}")
                 else:
+                    resolved = False
+                    # Try importing as a submodule first
                     try:
                         submod = self._lazy_import(f"{module_name}.{name}")
                         if submod is not None:
                             sandbox_globals[alias] = submod
                             assignments.append(f"{alias} = {alias}")
+                            resolved = True
                     except Exception:
-                        assignments.append(f"# {name} not found in {module_name}")
+                        pass
 
+                    # Fallback: re-import parent with importlib and getattr
+                    if not resolved:
+                        try:
+                            import importlib
+                            parent = importlib.import_module(module_name)
+                            if hasattr(parent, name):
+                                sandbox_globals[alias] = getattr(parent, name)
+                                assignments.append(f"{alias} = {alias}")
+                            else:
+                                assignments.append(f"# {name} not found in {module_name}")
+                        except Exception:
+                            assignments.append(f"# {name} not found in {module_name}")
             return '; '.join(assignments) if assignments else f"# from {module_name} import handled"
 
         return None
