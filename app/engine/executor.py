@@ -100,7 +100,7 @@ STORABLE_EXTENSIONS = {
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.svg'}
 
 # Patterns to strip from user code (we handle these internally)
-MATLOTLIB_USE_PATTERN = re_module.compile(
+MATPLOTLIB_USE_PATTERN = re_module.compile(
     r'^\s*matplotlib\s*\.\s*use\s*\(\s*[\'\"][^\'\"]*[\'\"]\s*\)\s*$',
     re_module.MULTILINE
 )
