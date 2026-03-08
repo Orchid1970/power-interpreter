@@ -162,23 +162,14 @@ def _build_content_blocks(resp_text: str) -> list:
         error_tb = data.get('error_traceback', '')
         error_text = f"Execution Error: {error_msg}"
         if error_tb:
-            error_text += f"\n\nTraceback:\n{'...' + error_tb[-500:] if len(error_tb) > 500 else error_tb}"
+            error_text += f"\n\nTraceback:\n{error_tb}"
         blocks.append({"type": "text", "text": error_text})
 
-    for info in data.get('download_urls', []):
-        if not info.get('is_image', False) and info.get('url'):
-            blocks.append({"type": "text", "text": f"File: {info.get('filename', 'file')} ({info.get('size', '')})\nDownload: {info['url']}"})
+    exec_time = data.get('execution_time_ms', 0)
+    if exec_time:
+        blocks.append({"type": "text", "text": f"Execution: {exec_time}ms"})
 
-    meta_parts = []
-    if data.get('execution_time_ms'):
-        meta_parts.append(f"Execution: {data['execution_time_ms']}ms")
-    ki = data.get('kernel_info', {})
-    if ki.get('session_persisted'):
-        meta_parts.append(f"Session: {ki.get('variable_count', 0)} vars (call #{ki.get('execution_count', 0)})")
-    if meta_parts:
-        blocks.append({"type": "text", "text": " | ".join(meta_parts)})
-
-    return blocks or [{"type": "text", "text": "Code executed successfully (no output)."}]
+    return blocks if blocks else [{"type": "text", "text": "(no output)"}]
 
 
 # ============================================================
@@ -186,35 +177,77 @@ def _build_content_blocks(resp_text: str) -> list:
 # ============================================================
 
 @mcp.tool()
-async def execute_code(code: str, session_id: str = "default", timeout: int = 55, sequence: int = 0) -> list:
-    """Execute Python in a persistent sandbox. Variables, imports, and files persist. Charts auto-captured.
+async def execute_code(
+    code: str,
+    session_id: str = "default",
+    timeout: int = 30,
+    sequence: int = 0
+) -> list:
+    """Execute Python code with full data-science stack (pandas, numpy, matplotlib, etc.).
+
+    IMPORTANT - SEQUENTIAL EXECUTION:
+    When running multi-step workflows, you MUST pass the 'sequence' parameter
+    to guarantee execution order. Variables persist across calls with the same
+    session_id, but only if steps execute in the correct order.
+
+    Rules for sequence:
+    - Set sequence=1 for the first execute_code call, sequence=2 for the second, etc.
+    - Steps execute in order: step 1 completes before step 2 starts.
+    - If you do NOT set sequence, order is not guaranteed and variables may be missing.
+    - Non-execute tools (list_files, fetch_from_url, etc.) are not sequenced.
+      If a later execute_code step depends on fetch_from_url, call fetch_from_url
+      FIRST and wait for its result before calling execute_code.
+
+    Example multi-step workflow:
+      Call 1: execute_code(code="import pandas as pd; df = pd.read_csv('data.csv')", sequence=1)
+      Call 2: execute_code(code="summary = df.describe()", sequence=2)
+      Call 3: execute_code(code="print(summary)", sequence=3)
 
     Args:
         code: Python code to execute
-        session_id: Session ID for kernel persistence (default: "default")
-        timeout: Max execution time in seconds (default: 55)
-        sequence: Step number for ordered execution (1, 2, 3...).
-                  When multiple calls arrive simultaneously, they execute in
-                  sequence order. Use 0 or omit to skip ordering.
+        session_id: Session ID for variable persistence (default: "default")
+        timeout: Max seconds (default: 30, max: 60)
+        sequence: Step number for ordered execution (1, 2, 3...). ALWAYS set this
+                  when running multiple execute_code calls in a workflow.
     """
+    payload = {
+        "code": code,
+        "session_id": session_id,
+        "timeout": timeout,
+    }
+    if sequence and sequence > 0:
+        payload["sequence"] = sequence
+
     try:
-        payload = {"code": code, "session_id": session_id, "timeout": timeout}
-        if sequence and sequence > 0:
-            payload["sequence"] = sequence
-        async with httpx.AsyncClient(timeout=timeout + 15) as client:
-            resp = await client.post(f"{API_BASE}/api/execute", headers=_headers(), json=payload)
+        async with httpx.AsyncClient(timeout=max(timeout + 15, 45)) as client:
+            resp = await client.post(
+                f"{API_BASE}/api/execute",
+                headers=_headers(),
+                json=payload
+            )
             blocks = _build_content_blocks(resp.text)
             return await _enrich_blocks_with_images(blocks, resp.text)
+    except httpx.TimeoutException:
+        return [{"type": "text", "text": f"execute_code HTTP timeout after {timeout + 15}s. Try submit_job for long tasks."}]
     except Exception as e:
         return [{"type": "text", "text": f"execute_code error: {e}"}]
 
 
 @mcp.tool()
-async def fetch_from_url(url: str, filename: Optional[str] = None, session_id: str = "default") -> list:
-    """Download a file from any URL into the sandbox."""
-    if not filename:
-        from urllib.parse import urlparse
-        filename = urlparse(url).path.split('/')[-1].split('?')[0] or 'downloaded_file'
+async def fetch_from_url(url: str, filename: str = "", session_id: str = "default") -> list:
+    """Download a file from any URL into the sandbox for processing.
+
+    The file is saved to the session's sandbox directory and can be accessed
+    by execute_code using just the filename.
+
+    IMPORTANT: If a subsequent execute_code call needs this file, call
+    fetch_from_url FIRST and wait for the result before calling execute_code.
+
+    Args:
+        url: URL to download from
+        filename: Save as this name (auto-detected from URL if empty)
+        session_id: Session ID (default: "default")
+    """
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(f"{API_BASE}/api/files/fetch", headers=_headers(),
@@ -299,7 +332,11 @@ async def get_job_result(job_id: str) -> list:
 
 @mcp.tool()
 async def load_dataset(file_path: str, dataset_name: str, session_id: str = "default", delimiter: str = ",") -> str:
-    """Load a file into PostgreSQL for SQL querying. Auto-detects CSV, Excel, PDF, JSON, Parquet."""
+    """Load a file into PostgreSQL for SQL querying. Auto-detects CSV, Excel, PDF, JSON, Parquet.
+
+    IMPORTANT: If loading a file downloaded via fetch_from_url, call fetch_from_url
+    FIRST and wait for its result before calling load_dataset.
+    """
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(f"{API_BASE}/api/data/load-csv", headers=_headers(),
