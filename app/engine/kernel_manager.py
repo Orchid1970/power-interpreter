@@ -15,9 +15,8 @@ Features:
 - Session metadata tracking (variable count, last activity, execution count)
 - Manual reset capability
 - has_session() check to avoid unnecessary globals rebuilds
-- Per-session execution locks to serialize concurrent calls
 
-Version: 2.2.0 - Add per-session exec locks for concurrent call safety
+Version: 2.3.0 - Remove threading exec locks (moved to async in executor)
 """
 
 import time
@@ -96,7 +95,9 @@ class KernelManager:
 
     Thread-safe. One namespace per session_id.
     Handles idle cleanup and max kernel limits.
-    Per-session execution locks serialize concurrent calls to the same session.
+
+    Note: Per-session execution locks are managed by the executor
+    using asyncio.Lock to avoid blocking the event loop.
     """
 
     def __init__(
@@ -106,24 +107,12 @@ class KernelManager:
     ):
         self._sessions: Dict[str, KernelSession] = {}
         self._lock = threading.Lock()
-        self._exec_locks: Dict[str, threading.Lock] = {}
         self.max_kernels = max_kernels
         self.idle_timeout = idle_timeout_seconds
         logger.info(
             f"KernelManager initialized: max_kernels={max_kernels}, "
             f"idle_timeout={idle_timeout_seconds}s"
         )
-
-    def get_exec_lock(self, session_id: str) -> threading.Lock:
-        """Get a per-session execution lock for serializing concurrent calls.
-
-        If SimTheory fires Steps 1-5 simultaneously for session="default",
-        this ensures they queue up and run in order instead of racing.
-        """
-        with self._lock:
-            if session_id not in self._exec_locks:
-                self._exec_locks[session_id] = threading.Lock()
-            return self._exec_locks[session_id]
 
     def has_session(self, session_id: str) -> bool:
         """Check if a session kernel exists (without modifying it).
@@ -158,8 +147,10 @@ class KernelManager:
             The persistent sandbox_globals dict for this session
         """
         with self._lock:
+            # Cleanup expired sessions first
             self._cleanup_expired()
 
+            # Return existing session
             if session_id in self._sessions:
                 session = self._sessions[session_id]
                 session.touch()
@@ -171,9 +162,11 @@ class KernelManager:
                 )
                 return session.sandbox_globals
 
+            # Check capacity - evict oldest idle if at max
             if len(self._sessions) >= self.max_kernels:
                 self._evict_oldest()
 
+            # Create new session
             session = KernelSession(
                 session_id=session_id,
                 sandbox_globals=sandbox_globals,
