@@ -221,6 +221,11 @@ class SessionSequencer:
 
     async def wait_for_turn(self, sequence: int, timeout: float = 120.0):
         """Wait until all sequences < this one have completed."""
+        # If sequence=1 arrives, reset state for a new batch
+        if sequence == 1:
+            self._completed.clear()
+            self._expected_max = 0
+
         self._active_batch = True
         self._expected_max = max(self._expected_max, sequence)
 
@@ -247,9 +252,9 @@ class SessionSequencer:
         async with self.condition:
             self.condition.notify_all()
 
-        if len(self._completed) >= self._expected_max:
-            self._completed.clear()
-            self._expected_max = 0
+        # Only deactivate batch flag when all expected steps are done
+        # Do NOT clear the completed set — let wait_for_turn(1) do that
+        if self._expected_max > 0 and len(self._completed) >= self._expected_max:
             self._active_batch = False
 
     async def wait_for_batch_clear(self, timeout: float = 120.0):
@@ -264,8 +269,7 @@ class SessionSequencer:
                 )
             except asyncio.TimeoutError:
                 logger.warning("Non-sequenced call timed out waiting for batch. Proceeding.")
-
-
+                
 class SandboxExecutor:
     def __init__(self, sandbox_dir: Path = None):
         self.sandbox_dir = sandbox_dir or settings.SANDBOX_DIR
