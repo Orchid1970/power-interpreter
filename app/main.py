@@ -171,16 +171,16 @@ async def serve_chart(session_id: str, filename: str):
             ext_map = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
                        '.svg': 'image/svg+xml', '.gif': 'image/gif', '.pdf': 'application/pdf'}
             fname_lower = filename.lower()
-            content_type = next((v for k, v in ext_map.items() if fname_lower.endswith(k)),
-                               getattr(file_record, 'content_type', None) or 'application/octet-stream')
+            ct = next((v for k, v in ext_map.items() if fname_lower.endswith(k)),
+                      getattr(file_record, 'mime_type', None) or 'application/octet-stream')
 
-            file_data = getattr(file_record, 'file_data', None) or getattr(file_record, 'data', None) or getattr(file_record, 'content', None)
+            file_data = file_record.content
             if file_data is None:
                 return JSONResponse(status_code=500, content={"error": "File record found but binary data missing"})
 
             return Response(
                 content=file_data,
-                media_type=content_type,
+                media_type=ct,
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
@@ -194,7 +194,7 @@ async def serve_chart(session_id: str, filename: str):
 
 
 # =============================================================================
-# MCP JSON-RPC HANDLER
+# MCP JSON-RPC HANDLER  (used by /mcp/sse POST — the path SimTheory hits)
 # =============================================================================
 
 def _build_tool_schema(tool) -> dict:
