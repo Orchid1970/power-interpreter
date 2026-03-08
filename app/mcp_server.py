@@ -1,5 +1,5 @@
 """Power Interpreter MCP Server - Tool definitions for SimTheory.ai
-Version: 2.9.2
+Version: 2.9.3
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -186,12 +186,23 @@ def _build_content_blocks(resp_text: str) -> list:
 # ============================================================
 
 @mcp.tool()
-async def execute_code(code: str, session_id: str = "default", timeout: int = 55) -> list:
-    """Execute Python in a persistent sandbox. Variables, imports, and files persist. Charts auto-captured."""
+async def execute_code(code: str, session_id: str = "default", timeout: int = 55, sequence: int = 0) -> list:
+    """Execute Python in a persistent sandbox. Variables, imports, and files persist. Charts auto-captured.
+
+    Args:
+        code: Python code to execute
+        session_id: Session ID for kernel persistence (default: "default")
+        timeout: Max execution time in seconds (default: 55)
+        sequence: Step number for ordered execution (1, 2, 3...).
+                  When multiple calls arrive simultaneously, they execute in
+                  sequence order. Use 0 or omit to skip ordering.
+    """
     try:
-        async with httpx.AsyncClient(timeout=timeout + 5) as client:
-            resp = await client.post(f"{API_BASE}/api/execute", headers=_headers(),
-                                     json={"code": code, "session_id": session_id, "timeout": timeout})
+        payload = {"code": code, "session_id": session_id, "timeout": timeout}
+        if sequence and sequence > 0:
+            payload["sequence"] = sequence
+        async with httpx.AsyncClient(timeout=timeout + 15) as client:
+            resp = await client.post(f"{API_BASE}/api/execute", headers=_headers(), json=payload)
             blocks = _build_content_blocks(resp.text)
             return await _enrich_blocks_with_images(blocks, resp.text)
     except Exception as e:
