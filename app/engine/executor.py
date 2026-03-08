@@ -1014,14 +1014,28 @@ class SandboxExecutor:
         session_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            sandbox_globals = kernel_manager.get_existing(session_id)
-            if sandbox_globals is None:
+            existing_globals = kernel_manager.get_existing(session_id)
+            if existing_globals is not None:
+                sandbox_globals = existing_globals
+                user_vars = [k for k in sandbox_globals if not k.startswith('_') and k not in (
+                    'pd','pandas','np','numpy','json','csv','math','statistics','datetime',
+                    'collections','itertools','functools','re','io','copy','hashlib','base64',
+                    'Path','SANDBOX_DIR','RESULT','plt','matplotlib','sns','seaborn',
+                    'Dict','List','Optional','Tuple','Set','Any','timedelta','timezone','date',
+                    'Decimal','Fraction','dataclass','field','asdict',
+                )]
+                logger.error(f"KERNEL_DIAG: REUSED session={session_id}, "
+                             f"user_vars={user_vars[:10]}, total_keys={len(sandbox_globals)}")
+            else:
                 fresh_globals = self._build_safe_globals(session_dir)
                 sandbox_globals = kernel_manager.get_or_create(
                     session_id=session_id,
                     sandbox_globals=fresh_globals,
                     session_dir=session_dir,
                 )
+                logger.error(f"KERNEL_DIAG: CREATED session={session_id}, "
+                             f"total_keys={len(sandbox_globals)}, "
+                             f"active_kernels={kernel_manager.active_count}")
         except Exception as e:
             result.success = False
             result.error_message = f"Kernel initialization failed: {e}"
