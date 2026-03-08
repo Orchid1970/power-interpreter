@@ -11,7 +11,7 @@ import traceback
 import tempfile
 import hashlib
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, Tuple, List
 from contextlib import redirect_stdout, redirect_stderr
 import logging
@@ -957,7 +957,7 @@ class SandboxExecutor:
 
                         expires_at = None
                         if ttl_hours > 0:
-                            expires_at = datetime.utcnow() + timedelta(hours=ttl_hours)
+                            expires_at = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
 
                         file_id = uuid.uuid4()
                         sandbox_file = SandboxFile(
@@ -1006,7 +1006,7 @@ class SandboxExecutor:
         raw_timeout = timeout
         timeout = max(timeout or settings.MAX_EXECUTION_TIME, MIN_EXECUTION_TIMEOUT)
         if raw_timeout and raw_timeout < MIN_EXECUTION_TIMEOUT:
-            logger.warning(f"Timeout floor: {raw_timeout}s -> {MIN_EXECUTION_TIMEOUT}s")
+            logger.debug(f"Timeout floor: {raw_timeout}s -> {MIN_EXECUTION_TIMEOUT}s")
 
         logger.info(f"execute: session={session_id}, timeout={timeout}s, code={code[:80]}...")
 
