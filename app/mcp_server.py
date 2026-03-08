@@ -219,7 +219,7 @@ async def execute_code(
         payload["sequence"] = sequence
 
     try:
-        async with httpx.AsyncClient(timeout=max(timeout + 15, 45)) as client:
+        async with httpx.AsyncClient(timeout=max(timeout + 15, 120)) as client:
             resp = await client.post(
                 f"{API_BASE}/api/execute",
                 headers=_headers(),
@@ -228,7 +228,7 @@ async def execute_code(
             blocks = _build_content_blocks(resp.text)
             return await _enrich_blocks_with_images(blocks, resp.text)
     except httpx.TimeoutException:
-        return [{"type": "text", "text": f"execute_code HTTP timeout after {timeout + 15}s. Try submit_job for long tasks."}]
+        return [{"type": "text", "text": f"execute_code HTTP timeout after {max(timeout + 15, 120)}s. Try submit_job for long tasks."}]
     except Exception as e:
         return [{"type": "text", "text": f"execute_code error: {e}"}]
 
