@@ -957,7 +957,7 @@ class SandboxExecutor:
 
                         expires_at = None
                         if ttl_hours > 0:
-                            expires_at = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
+                            expires_at = datetime.utcnow() + timedelta(hours=ttl_hours)
 
                         file_id = uuid.uuid4()
                         sandbox_file = SandboxFile(
@@ -1001,6 +1001,11 @@ class SandboxExecutor:
 
     async def execute(self, code: str, session_id: str = "default",
                       timeout: int = None, context: Dict = None) -> ExecutionResult:
+        """Execute code in a persistent sandboxed namespace.
+
+        Acquires a per-session lock so concurrent calls to the same
+        session_id queue up instead of racing.
+        """
         result = ExecutionResult()
 
         raw_timeout = timeout
@@ -1008,10 +1013,25 @@ class SandboxExecutor:
         if raw_timeout and raw_timeout < MIN_EXECUTION_TIMEOUT:
             logger.debug(f"Timeout floor: {raw_timeout}s -> {MIN_EXECUTION_TIMEOUT}s")
 
-        logger.info(f"execute: session={session_id}, timeout={timeout}s, code={code[:80]}...")
-
         session_dir = self.sandbox_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
+
+        # Serialize concurrent calls to the same session
+        exec_lock = kernel_manager.get_exec_lock(session_id)
+        exec_lock.acquire()
+        try:
+            return await self._execute_locked(
+                code, session_id, session_dir, timeout, result, context
+            )
+        finally:
+            exec_lock.release()
+
+    async def _execute_locked(self, code: str, session_id: str, session_dir: Path,
+                               timeout: int, result: ExecutionResult,
+                               context: Dict = None) -> ExecutionResult:
+        """Execute code while holding the per-session lock."""
+
+        logger.info(f"execute: session={session_id}, timeout={timeout}s")
 
         try:
             existing_globals = kernel_manager.get_existing(session_id)
