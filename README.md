@@ -8,7 +8,7 @@ Built for [SimTheory.ai](https://simtheory.ai) — execute Python code, load dat
 
 ## Version
 
-**v2.9.1** — Centralized version constant, token-optimized MCP descriptions, smart empty-argument handling, startup consistency across all components.
+**v2.9.2** — LLM code-correction layer, `requests` library added to sandbox, pandas 2.x frequency alias auto-patching, urllib method name correction.
 
 ---
 
@@ -107,6 +107,25 @@ All formats are loaded into PostgreSQL in 50K-row chunks with automatic indexing
 
 ## Sandbox Features
 
+### LLM Code Correction Layer (v2.9.2)
+
+The executor includes a pre-execution patching step (`_patch_common_llm_mistakes`) that silently corrects known LLM code-generation errors before the sandbox runs the code:
+
+| Pattern | Correction | Reason |
+|---------|-----------|--------|
+| `freq='M'` | `freq='ME'` | pandas 2.x deprecated single-letter frequency aliases |
+| `freq='Q'` | `freq='QE'` | Same — quarter end |
+| `freq='Y'` / `freq='A'` | `freq='YE'` | Same — year end |
+| `freq='H'` | `freq='h'` | Same — hour (case change) |
+| `freq='T'` | `freq='min'` | Same — minute |
+| `freq='S'` | `freq='s'` | Same — second (case change) |
+| `freq='BM'` | `freq='BME'` | Same — business month end |
+| `.resample('M')` | `.resample('ME')` | Same pattern in resample calls |
+| `.asfreq('M')` | `.asfreq('ME')` | Same pattern in asfreq calls |
+| `urllib.request.request(url)` | `urllib.request.urlopen(url)` | LLM hallucinated method name |
+
+This layer also works with the import resolution system (`_handle_import_line`) which resolves `from openpyxl.styles import Font, PatternFill, ...` and similar deep submodule imports via importlib fallback.
+
 ### Pre-loaded Globals (available without imports)
 
 | Name | Type | Since |
@@ -136,7 +155,7 @@ All formats are loaded into PostgreSQL in 50K-row chunks with automatic indexing
 | xlsxwriter | | |
 | pdfplumber | | |
 | reportlab | | platypus, pdfgen sub-modules |
-| requests | | HTTP client |
+| requests | | HTTP client (added v2.9.2) |
 | warnings | | utility support |
 | abc | | abstract base classes |
 | enum | | enum support |
@@ -240,7 +259,7 @@ power-interpreter/
 │   ├── models.py              # SQLAlchemy models
 │   ├── engine/
 │   │   ├── data_manager.py    # Universal data loading (CSV/Excel/PDF/JSON/Parquet)
-│   │   ├── executor.py        # Sandboxed Python execution
+│   │   ├── executor.py        # Sandboxed Python execution + LLM code correction
 │   │   ├── file_manager.py    # Sandbox file management
 │   │   ├── job_manager.py     # Async job queue
 │   │   └── kernel_manager.py  # Persistent Python kernel sessions
@@ -263,6 +282,7 @@ power-interpreter/
 
 | Version | Date | Component | Changes |
 |---------|------|-----------|---------|
+| **v2.9.2** | 2026-03-08 | executor, requirements, docs | LLM code-correction layer (`_patch_common_llm_mistakes`); `requests` library added to sandbox; pandas 2.x freq alias auto-patching; `urllib.request.request()` → `urlopen()` correction; `.asfreq()` patching |
 | **v2.9.1** | 2026-03-07 | main, start, docs | Centralized version constant; startup consistency; `datetime.utcnow()` replaced; docs refresh |
 | **v2.9.0** | 2026-03 | mcp_server | Trimmed all tool descriptions for token optimization (~57% reduction) |
 | **v2.8.6** | 2026-03 | all | Version unification across all files |
