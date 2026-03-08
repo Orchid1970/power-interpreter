@@ -757,6 +757,9 @@ class SandboxExecutor:
                     }
                     mime_type = mime_type_map.get(ext, 'application/octet-stream')
 
+                    # Use naive UTC datetimes to match the model's server_default
+                    now_utc = datetime.utcnow()
+
                     sandbox_file = SandboxFile(
                         id=file_id,
                         session_id=session_id,
@@ -765,7 +768,8 @@ class SandboxExecutor:
                         file_size=file_size,
                         content=file_data,
                         checksum=hashlib.sha256(file_data).hexdigest(),
-                        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+                        created_at=now_utc,
+                        expires_at=now_utc + timedelta(hours=24),
                     )
                     db_session.add(sandbox_file)
 
