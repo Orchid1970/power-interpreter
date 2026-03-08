@@ -11,25 +11,20 @@ Features:
 - Pre-installed data science libraries
 - Persistent session state (kernel architecture)
 - Auto file storage in Postgres with public download URLs
-- Microsoft OneDrive + SharePoint integration (v1.9.0)
+- Optional Microsoft OneDrive + SharePoint integration
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.9.2
+Version: see app/version.py
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
-  v1.8.0: base64 ImageContent blocks in mcp_server.py (enrichment worked
-           but SimTheory doesn't render MCP image blocks)
-  v1.8.1: Added /charts/{session_id}/{filename} route. SimTheory constructs
-           image URLs at this path pattern. Previously 404'd because route
-           didn't exist. Now serves chart PNG bytes from Postgres with
-           correct Content-Type. Public endpoint, no auth (same as /dl/).
-           Evidence: "GET /charts/chart-test-v181/chart_001.png 404"
-  v1.9.0: Microsoft OneDrive + SharePoint integration (20 new MCP tools).
-  v1.9.1: Fix Microsoft bootstrap ordering — moved init after base tools
-           so a Microsoft failure can never take down the 12 core tools.
-  v1.9.2: Fix Microsoft token persistence — SQLAlchemy rewrite, ensure_db_table
-           in lifespan, ms_auth_poll tool, memory guard module.
+  v1.8.1: Chart serving route + inline base64 image blocks
+  v1.9.0: Microsoft OneDrive + SharePoint integration (20 new MCP tools)
+  v1.9.2: Token persistence rewrite (SQLAlchemy), ms_auth_poll tool
+  v2.8.6: Version unification across all files
+  v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction)
+  v2.9.1: Smart error handling for empty execute_code args; centralized
+           version constant; startup consistency; datetime.utcnow removed
 """
 
 import logging
@@ -37,11 +32,12 @@ import asyncio
 import json
 import inspect
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, Request
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.version import __version__
 from app.config import settings
 from app.auth import verify_api_key
 from app.routes import execute, jobs, files, data, sessions, health
@@ -61,9 +57,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
-    logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.9.2 starting...")
-    logger.info("="*60)
+    logger.info("=" * 60)
+    logger.info(f"Power Interpreter MCP v{__version__} starting...")
+    logger.info("=" * 60)
 
     # Ensure directories exist
     settings.ensure_directories()
@@ -83,7 +79,7 @@ async def lifespan(app: FastAPI):
         logger.warning("No DATABASE_URL configured. Running without database.")
         logger.warning("Set DATABASE_URL to enable: jobs, sessions, datasets, file tracking")
 
-    # ── Initialize Microsoft token persistence (v1.9.2) ──────────
+    # Initialize Microsoft token persistence
     if db_ok:
         try:
             from app.mcp_server import _ms_auth
@@ -92,10 +88,11 @@ async def lifespan(app: FastAPI):
                 logger.info("Microsoft token persistence: ENABLED (Postgres)")
             else:
                 logger.info("Microsoft token persistence: SKIPPED (no auth manager)")
+        except ImportError:
+            logger.info("Microsoft auth module not available")
         except Exception as e:
             logger.warning(f"Microsoft token table setup failed: {e}")
             logger.warning("Microsoft auth will work but tokens won't persist across deploys")
-    # ── END Microsoft token persistence ──────────────────────────
 
     # Start periodic cleanup (jobs + expired sandbox files)
     cleanup_task = None
@@ -106,6 +103,7 @@ async def lifespan(app: FastAPI):
     public_url = settings.public_base_url
 
     logger.info("Power Interpreter ready!")
+    logger.info(f"  Version: {__version__}")
     logger.info(f"  Database: {'connected' if db_ok else 'NOT CONNECTED'}")
     logger.info(f"  Sandbox dir: {settings.SANDBOX_DIR}")
     logger.info(f"  Public URL: {public_url or '(auto-detect from RAILWAY_PUBLIC_DOMAIN)'}")
@@ -171,7 +169,7 @@ async def _cleanup_expired_sandbox_files():
             result = await session.execute(
                 delete(SandboxFile).where(
                     SandboxFile.expires_at != None,
-                    SandboxFile.expires_at < datetime.utcnow()
+                    SandboxFile.expires_at < datetime.now(timezone.utc)
                 )
             )
             deleted = result.rowcount
@@ -191,9 +189,9 @@ app = FastAPI(
         "and run long-running analysis jobs without timeouts. "
         "Generated files get persistent download URLs via /dl/{file_id}. "
         "Charts served at /charts/{session_id}/{filename}. "
-        "Microsoft OneDrive + SharePoint integration (v1.9.2)."
+        "Optional Microsoft OneDrive + SharePoint integration."
     ),
-    version="1.9.2",
+    version=__version__,
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -210,7 +208,7 @@ app.add_middleware(
 
 
 # =============================================================================
-# CHART SERVING ROUTE (v1.8.1)
+# CHART SERVING ROUTE
 # =============================================================================
 
 @app.get("/charts/{session_id}/{filename}")
@@ -219,8 +217,7 @@ async def serve_chart(session_id: str, filename: str):
 
     SimTheory auto-constructs these URLs from MCP tool responses.
     Looks up the most recent matching file in Postgres and serves it.
-
-    Public endpoint — no authentication required (same as /dl/).
+    Public endpoint -- no authentication required.
     """
     logger.info(f"Chart request: session={session_id} filename={filename}")
 
@@ -241,9 +238,7 @@ async def serve_chart(session_id: str, filename: str):
             file_record = result.scalar_one_or_none()
 
             if not file_record:
-                logger.warning(
-                    f"Chart not found: session={session_id} filename={filename}"
-                )
+                logger.warning(f"Chart not found: session={session_id} filename={filename}")
                 return JSONResponse(
                     status_code=404,
                     content={
@@ -252,6 +247,7 @@ async def serve_chart(session_id: str, filename: str):
                     }
                 )
 
+            # Determine Content-Type
             content_type = getattr(file_record, 'content_type', None) or 'application/octet-stream'
             fname_lower = filename.lower()
             if fname_lower.endswith('.png'):
@@ -265,6 +261,7 @@ async def serve_chart(session_id: str, filename: str):
             elif fname_lower.endswith('.pdf'):
                 content_type = 'application/pdf'
 
+            # Get the binary data
             file_data = getattr(file_record, 'file_data', None)
             if file_data is None:
                 file_data = getattr(file_record, 'data', None)
@@ -293,7 +290,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v1.9.2",
+                    "X-Power-Interpreter": f"chart-serve-v{__version__}",
                 }
             )
 
@@ -314,6 +311,7 @@ async def serve_chart(session_id: str, filename: str):
 # =============================================================================
 # DIRECT MCP JSON-RPC HANDLER (for SimTheory)
 # =============================================================================
+
 
 def _build_tool_schema(tool) -> dict:
     """Build the JSON Schema for a tool's input parameters."""
@@ -390,7 +388,7 @@ def _get_tools_list() -> list:
     return result
 
 
-def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
+def _validate_tool_args(fn, tool_args: dict, tool_name: str):
     """Validate that all required arguments are present before calling a tool."""
     try:
         sig = inspect.signature(fn)
@@ -452,10 +450,12 @@ async def _handle_single_jsonrpc(data: dict):
 
     logger.info(f"MCP direct: method={method}  id={msg_id}")
 
+    # Notifications
     if msg_id is None or method.startswith("notifications/"):
         logger.info(f"MCP direct: notification '{method}' ack")
         return None
 
+    # initialize
     if method == "initialize":
         logger.info("MCP direct: -> initialize response")
         return {
@@ -468,14 +468,16 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.9.2",
+                    "version": __version__,
                 },
             },
         }
 
+    # ping
     if method == "ping":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
+    # tools/list
     if method == "tools/list":
         tools = _get_tools_list()
         logger.info(f"MCP direct: -> {len(tools)} tools")
@@ -487,6 +489,7 @@ async def _handle_single_jsonrpc(data: dict):
             "result": {"tools": tools},
         }
 
+    # tools/call
     if method == "tools/call":
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
@@ -507,12 +510,31 @@ async def _handle_single_jsonrpc(data: dict):
 
             validation_error = _validate_tool_args(fn, tool_args, tool_name)
             if validation_error:
-                logger.warning(f"MCP direct: {tool_name} argument validation failed: {validation_error}")
+                logger.warning(
+                    f"MCP direct: {tool_name} argument validation failed: {validation_error} | "
+                    f"Full params size: {len(json.dumps(params))} bytes | "
+                    f"Argument keys received: {list(tool_args.keys())} | "
+                    f"Arguments empty: {len(tool_args) == 0}"
+                )
+
+                if tool_name == "execute_code" and len(tool_args) == 0:
+                    error_text = (
+                        "ERROR: No code was provided -- the 'code' argument was empty. "
+                        "This typically happens when the code block is too large for a single tool call. "
+                        "Please try one of these approaches:\n"
+                        "1. Break your code into smaller sequential steps\n"
+                        "2. Write a shorter code snippet that saves to a .py file, then execute that file\n"
+                        "3. Simplify your approach -- fewer lines per execution call\n"
+                        "4. If this keeps happening, start a fresh conversation to reset context"
+                    )
+                else:
+                    error_text = f"Error: {validation_error}"
+
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "result": {
-                        "content": [{"type": "text", "text": f"Error: {validation_error}"}],
+                        "content": [{"type": "text", "text": error_text}],
                         "isError": True,
                     },
                 }
@@ -549,6 +571,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
             }
 
+    # Unknown method
     logger.warning(f"MCP direct: unknown method '{method}'")
     return {
         "jsonrpc": "2.0",
@@ -561,17 +584,17 @@ async def _handle_single_jsonrpc(data: dict):
 # ROUTE MOUNTING
 # =============================================================================
 
-# --- PUBLIC ROUTES (no auth) ---
+# Public routes (no auth)
 app.include_router(health.router, tags=["Health"])
 
-# --- PUBLIC DOWNLOAD (no auth) ---
+# Public download (no auth)
 app.include_router(
     download_router,
     prefix="/dl",
     tags=["Downloads"],
 )
 
-# --- PROTECTED ROUTES (API key required) ---
+# Protected routes (API key required)
 app.include_router(
     execute.router,
     prefix="/api",
@@ -603,5 +626,5 @@ app.include_router(
     dependencies=[Depends(verify_api_key)],
 )
 
-# --- MCP SSE TRANSPORT (for standard MCP clients) ---
+# MCP SSE transport (for standard MCP clients)
 app.mount("/mcp", mcp.sse_app())
