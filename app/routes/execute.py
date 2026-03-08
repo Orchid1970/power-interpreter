@@ -20,6 +20,7 @@ class ExecuteRequest(BaseModel):
     session_id: str = Field(default="default", description="Session ID for file isolation")
     timeout: Optional[int] = Field(default=30, description="Max execution time in seconds (max 60 for sync)")
     context: Optional[Dict] = Field(default=None, description="Variables to inject into sandbox")
+    sequence: Optional[int] = Field(default=None, description="Step number for ordered execution (1, 2, 3...). When multiple calls arrive simultaneously, they execute in sequence order.")
 
 
 class ExecuteResponse(BaseModel):
@@ -58,7 +59,8 @@ async def execute_code(request: ExecuteRequest):
         code=request.code,
         session_id=request.session_id,
         timeout=timeout,
-        context=request.context
+        context=request.context,
+        sequence=request.sequence
     )
     
     return result.to_dict()
