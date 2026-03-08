@@ -1,5 +1,5 @@
 """Power Interpreter MCP Server - Tool definitions for SimTheory.ai
-Version: 2.9.3
+Version: 2.9.4
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -240,6 +240,8 @@ async def fetch_from_url(url: str, filename: str = "", session_id: str = "defaul
     The file is saved to the session's sandbox directory and can be accessed
     by execute_code using just the filename.
 
+    Supports OneDrive, SharePoint, Google Drive, Dropbox, S3, and any public URL.
+
     IMPORTANT: If a subsequent execute_code call needs this file, call
     fetch_from_url FIRST and wait for the result before calling execute_code.
 
@@ -296,7 +298,7 @@ async def list_files(session_id: Optional[str] = "default") -> str:
 
 
 @mcp.tool()
-async def submit_job(code: str, session_id: str = "default", timeout: int = 600) -> str:
+async def submit_job(code: str, session_id: str = "default", timeout: int = 600, **kwargs) -> str:
     """Submit a long-running job (up to 30 min). Returns job_id."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
