@@ -1111,7 +1111,7 @@ class SandboxExecutor:
                             'alt_text': info['filename'].replace('_', ' ').replace('.png', ''),
                         })
 
-                                non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
+                non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
 
                 # Build download link sections
                 link_sections = []
