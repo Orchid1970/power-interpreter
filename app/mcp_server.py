@@ -1,5 +1,5 @@
 """Power Interpreter MCP Server - Tool definitions for SimTheory.ai
-Version: 2.9.4
+Version: 2.9.5
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -25,7 +25,15 @@ _DL_IMAGE_URL_RE = re.compile(
     re.IGNORECASE
 )
 _MARKDOWN_IMAGE_RE = re.compile(r'!\[[^\]]*\]\([^\)]*\.(?:png|jpg|jpeg|svg|gif)\)', re.IGNORECASE)
-_GENERATED_CHARTS_RE = re.compile(r'Generated charts?:\s*\n*', re.IGNORECASE)
+
+# Matches the chart section header we prepend in executor.py
+_CHART_SECTION_RE = re.compile(
+    r'\n?📊\s*\*\*Generated charts?\s*\(embed these inline for the user\):\*\*.*',
+    re.IGNORECASE | re.DOTALL
+)
+
+# Matches the separator between link sections and code output
+_LINK_CODE_SEPARATOR = '\n\n---\n\n'
 
 logger.info(f"MCP Server: API_BASE={API_BASE}")
 logger.info(f"MCP Server: API_KEY={'***configured***' if API_KEY else 'NOT SET'}")
@@ -40,6 +48,7 @@ def _headers():
 # ============================================================
 
 async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
+    """Fetch an image from the internal download endpoint and return as base64 block."""
     from urllib.parse import quote
     internal_url = f"{API_BASE}/dl/{file_id}/{quote(filename)}"
     try:
@@ -67,16 +76,68 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
 
 
 def _extract_image_urls_from_stdout(stdout: str) -> List[Tuple[str, str, str]]:
+    """Extract /dl/ image URLs from stdout text."""
     return _DL_IMAGE_URL_RE.findall(stdout)
 
 
-def _strip_image_markdown_from_text(text: str) -> str:
+def _split_stdout_sections(stdout: str) -> Tuple[str, str, str]:
+    """Split stdout into three parts: download_links, chart_links, code_output.
+
+    executor.py prepends content in this format:
+        📥 **Generated files ready for download...**
+        - [filename (size)](url)
+
+        📊 **Generated charts (embed these inline for the user):**
+        ![alt](url)
+
+        ---
+
+        (original code output here)
+
+    Returns:
+        (download_links_section, chart_links_section, code_output)
+    """
+    download_links = ""
+    chart_links = ""
+    code_output = stdout
+
+    # Split at the --- separator first
+    if _LINK_CODE_SEPARATOR in stdout:
+        link_part, code_output = stdout.split(_LINK_CODE_SEPARATOR, 1)
+    else:
+        link_part = ""
+        code_output = stdout
+
+    if not link_part:
+        return "", "", code_output
+
+    # Now split link_part into download section and chart section
+    chart_match = _CHART_SECTION_RE.search(link_part)
+    if chart_match:
+        download_links = link_part[:chart_match.start()].strip()
+        chart_links = link_part[chart_match.start():].strip()
+    else:
+        # No chart section — everything is download links
+        download_links = link_part.strip()
+
+    return download_links, chart_links, code_output
+
+
+def _clean_code_output(text: str) -> str:
+    """Remove any stray image markdown from code output (belt-and-suspenders)."""
     cleaned = _MARKDOWN_IMAGE_RE.sub('', text)
-    cleaned = _GENERATED_CHARTS_RE.sub('', cleaned)
     return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
 
 async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
+    """Enrich response blocks with base64 images and download link text.
+
+    Strategy:
+    1. Extract inline_images and download_urls from the JSON response
+    2. Fetch chart images as base64 for inline display
+    3. Build a clean download-links text block for non-image files
+    4. Ensure the LLM sees both the images AND the download URLs
+    """
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
@@ -86,15 +147,19 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
     download_urls = data.get('download_urls', [])
     stdout = data.get('stdout', '')
 
+    # Separate non-image downloads from image downloads
+    non_image_downloads = [d for d in download_urls if not d.get('is_image', False)]
+    image_downloads = [d for d in download_urls if d.get('is_image', False)]
+
     image_blocks = []
     fallback_blocks = []
-    images_found = False
 
-    # Path A: inline_images from JSON
+    # --- Fetch chart images as base64 blocks ---
     if inline_images:
-        images_found = True
-        file_id_map = {dl['filename']: {'file_id': dl.get('file_id', ''), 'url': dl.get('url', '')}
-                       for dl in download_urls if dl.get('is_image')}
+        file_id_map = {
+            dl['filename']: {'file_id': str(dl.get('file_id', '')), 'url': dl.get('url', '')}
+            for dl in image_downloads
+        }
 
         for img in inline_images:
             filename = img.get('filename', '')
@@ -107,36 +172,90 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                 if block:
                     image_blocks.append(block)
                     continue
+            # Fallback: provide URL as text if base64 fetch failed
             if public_url:
-                fallback_blocks.append({"type": "text", "text": f"Chart: {img.get('alt_text', filename)}\nURL: {public_url}"})
+                fallback_blocks.append({
+                    "type": "text",
+                    "text": f"![{img.get('alt_text', filename)}]({public_url})"
+                })
 
-    # Path B: scan stdout for /dl/ URLs
-    if not images_found and stdout:
+    elif not inline_images and stdout:
+        # Path B: scan stdout for /dl/ image URLs (legacy fallback)
         url_matches = _extract_image_urls_from_stdout(stdout)
         if url_matches:
-            images_found = True
             for full_url, file_id, filename in url_matches:
                 block = await _fetch_image_base64(file_id, filename)
                 if block:
                     image_blocks.append(block)
                 else:
-                    fallback_blocks.append({"type": "text", "text": f"Chart: {filename}\nURL: {full_url}"})
+                    fallback_blocks.append({
+                        "type": "text",
+                        "text": f"![{filename}]({full_url})"
+                    })
 
-    # Strip markdown image syntax from text blocks
-    if image_blocks and blocks:
+    # --- Build the download links text block for non-image files ---
+    download_text = ""
+    if non_image_downloads:
+        lines = ["📥 **Download Links** (present these as clickable links to the user):"]
+        for dl in non_image_downloads:
+            lines.append(f"- [{dl['filename']} ({dl.get('size', '')})]({dl['url']})")
+        download_text = "\n".join(lines)
+
+    # --- Rebuild the text blocks ---
+    # The first text block contains stdout which has our prepended sections.
+    # We need to:
+    #   1. Strip the chart markdown (since we're sending base64 images instead)
+    #   2. Keep the download links for non-image files
+    #   3. Keep the code output
+    if blocks and (image_blocks or non_image_downloads):
         for i, block in enumerate(blocks):
             if block.get('type') == 'text':
-                cleaned = _strip_image_markdown_from_text(block['text'])
-                if cleaned != block['text']:
-                    blocks[i] = {"type": "text", "text": cleaned} if cleaned else None
+                original_text = block['text']
+
+                # Split into sections
+                dl_section, chart_section, code_section = _split_stdout_sections(original_text)
+
+                # Rebuild: download links (from structured data) + clean code output
+                parts = []
+
+                # Use structured download_text instead of parsed dl_section
+                # (more reliable — comes from JSON, not stdout parsing)
+                if download_text:
+                    parts.append(download_text)
+                elif dl_section:
+                    # Fallback: use the prepended text from stdout
+                    parts.append(dl_section)
+
+                # Add cleaned code output
+                clean_output = _clean_code_output(code_section)
+                if clean_output:
+                    parts.append(clean_output)
+
+                new_text = "\n\n".join(parts) if parts else ""
+                if new_text:
+                    blocks[i] = {"type": "text", "text": new_text}
+                else:
+                    blocks[i] = None
                 break
+
         blocks = [b for b in blocks if b is not None]
 
-    # Insert image blocks after first text block
-    if image_blocks or fallback_blocks:
-        insert_pos = next((i + 1 for i, b in enumerate(blocks) if b.get('type') == 'text'), 0)
-        for j, block in enumerate(image_blocks + fallback_blocks):
+    # --- Insert image blocks after first text block ---
+    all_image_blocks = image_blocks + fallback_blocks
+    if all_image_blocks:
+        insert_pos = next(
+            (i + 1 for i, b in enumerate(blocks) if b.get('type') == 'text'),
+            0
+        )
+        for j, block in enumerate(all_image_blocks):
             blocks.insert(insert_pos + j, block)
+
+    # --- Safety net: if we have download URLs but no text block mentions them ---
+    if non_image_downloads and not any(
+        b.get('type') == 'text' and '/dl/' in b.get('text', '')
+        for b in blocks
+    ):
+        blocks.insert(0, {"type": "text", "text": download_text})
 
     return blocks
 
@@ -146,6 +265,7 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
 # ============================================================
 
 def _build_content_blocks(resp_text: str) -> list:
+    """Build initial MCP content blocks from the API response."""
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
@@ -184,6 +304,12 @@ async def execute_code(
     sequence: int = 0
 ) -> list:
     """Execute Python code with full data-science stack (pandas, numpy, matplotlib, etc.).
+
+    IMPORTANT - FILE DOWNLOADS:
+    When code generates files (Excel, CSV, PDF, charts, etc.), the response will
+    include download_urls with LIVE HTTPS links. You MUST present these links
+    to the user as clickable markdown links. Never say files are "local only" —
+    all generated files are hosted and downloadable.
 
     IMPORTANT - SEQUENTIAL EXECUTION:
     When running multi-step workflows, you MUST pass the 'sequence' parameter
