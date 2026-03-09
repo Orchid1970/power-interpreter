@@ -854,7 +854,7 @@ class SandboxExecutor:
 
                     file_data = full_path.read_bytes()
                     file_size = len(file_data)
-                    file_id = str(uuid.uuid4())
+                    file_id = uuid.uuid4()
 
                     mime_type_map = {
                         '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -909,9 +909,11 @@ class SandboxExecutor:
                     })
 
                 await db_session.commit()
+                logger.info(f"Stored {len(download_info)} files in Postgres for session={session_id}")
 
         except Exception as e:
             logger.error(f"Postgres file storage failed: {e}", exc_info=True)
+            download_info = []
 
         return download_info
 
