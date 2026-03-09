@@ -1111,18 +1111,25 @@ class SandboxExecutor:
                             'alt_text': info['filename'].replace('_', ' ').replace('.png', ''),
                         })
 
-                non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
+                                non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
+
+                # Build download link sections
+                link_sections = []
+
                 if non_image_downloads:
-                    url_lines = ["\n\n📥 **Generated files ready for download (present these as clickable markdown links to the user):**"]
+                    link_sections.append("\n📥 **Generated files ready for download (present these as clickable markdown links to the user):**")
                     for info in non_image_downloads:
-                        url_lines.append(f"\n- [{info['filename']} ({info['size']})]({info['url']})")
-                    result.stdout = result.stdout + '\n'.join(url_lines)
+                        link_sections.append(f"\n- [{info['filename']} ({info['size']})]({info['url']})")
 
                 if result.inline_images:
-                    img_lines = ["\n\n📊 **Generated charts (embed these inline for the user):**"]
+                    link_sections.append("\n📊 **Generated charts (embed these inline for the user):**")
                     for img in result.inline_images:
-                        img_lines.append(f"\n![{img['alt_text']}]({img['url']})")
-                    result.stdout = result.stdout + '\n'.join(img_lines)
+                        link_sections.append(f"\n![{img['alt_text']}]({img['url']})")
+
+                # PREPEND links before code output, cap code output to 50KB
+                if link_sections:
+                    code_output = result.stdout[:50000]
+                    result.stdout = '\n'.join(link_sections) + '\n\n---\n\n' + code_output
 
             except Exception as e:
                 logger.error(f"File storage failed (non-fatal): {e}", exc_info=True)
