@@ -1,2 +1,2 @@
 """Single source of truth for Power Interpreter version."""
-__version__ = "2.9.2"
+__version__ = "2.9.3"
