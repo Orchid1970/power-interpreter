@@ -179,7 +179,7 @@ class ChartCapture:
             logger.error(f"Auto-capture of unclosed figures failed: {e}")
 
         def make_savefig_wrapper(self, original_savefig):
-        capture = self
+            capture = self
 
         def _tracking_savefig(self_fig, fname, *args, **kwargs):
             result = original_savefig(self_fig, fname, *args, **kwargs)
