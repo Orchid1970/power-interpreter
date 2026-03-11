@@ -1073,9 +1073,6 @@ class SandboxExecutor:
             result.stdout = stdout_capture.getvalue()
             result.stderr = stderr_capture.getvalue()
 
-            logger.info(f"done: success={result.success}, {result.execution_time_ms}ms, "
-                        f"charts={len(chart_capture.captured_charts)}")
-
             if result.error_message:
                 logger.error(f"error: {result.error_message}")
 
@@ -1086,14 +1083,42 @@ class SandboxExecutor:
                 except Exception:
                     result.memory_used_mb = 0.0
 
+            # ── File detection: compare before/after ──
+            new_files_from_diff = set()
             if session_dir.exists():
                 try:
                     files_after = set(str(p) for p in session_dir.rglob('*') if p.is_file())
-                    new_files = files_after - files_before
-                    result.files_created = [str(Path(f).relative_to(session_dir)) for f in new_files]
+                    new_files_from_diff = files_after - files_before
                 except Exception:
                     pass
 
+            # ── Savefig-tracked files: add any that the diff missed ──
+            savefig_files = set()
+            for tracked in chart_capture._savefig_tracked:
+                tracked_path = Path(tracked)
+                if not tracked_path.is_absolute():
+                    tracked_path = session_dir / tracked_path
+                if tracked_path.exists():
+                    savefig_files.add(str(tracked_path))
+
+            # ── Merge all detected files ──
+            all_new_files = new_files_from_diff | savefig_files
+            result.files_created = [
+                str(Path(f).relative_to(session_dir))
+                for f in all_new_files
+                if Path(f).suffix.lower() in STORABLE_EXTENSIONS
+            ]
+
+            logger.info(
+                f"done: success={result.success}, {result.execution_time_ms}ms, "
+                f"charts={len(chart_capture.captured_charts)}, "
+                f"savefig_tracked={len(chart_capture._savefig_tracked)}, "
+                f"diff_new={len(new_files_from_diff)}, "
+                f"files_created={len(result.files_created)}: "
+                f"{result.files_created[:5]}"
+            )
+
+        # ── Store files in Postgres and build download URLs ──
         if result.files_created:
             try:
                 download_info = await self._store_files_in_postgres(
@@ -1117,19 +1142,37 @@ class SandboxExecutor:
                 link_sections = []
 
                 if non_image_downloads:
-                    link_sections.append("\n📥 **Generated files ready for download (present these as clickable markdown links to the user):**")
+                    link_sections.append(
+                        "\n📥 **Generated files ready for download "
+                        "(present these as clickable markdown links to the user):**"
+                    )
                     for info in non_image_downloads:
-                        link_sections.append(f"\n- [{info['filename']} ({info['size']})]({info['url']})")
+                        link_sections.append(
+                            f"\n- [{info['filename']} ({info['size']})]({info['url']})"
+                        )
 
                 if result.inline_images:
-                    link_sections.append("\n📊 **Generated charts (embed these inline for the user):**")
+                    link_sections.append(
+                        "\n📊 **Generated charts (embed these inline for the user):**"
+                    )
                     for img in result.inline_images:
-                        link_sections.append(f"\n![{img['alt_text']}]({img['url']})")
+                        link_sections.append(
+                            f"\n![{img['alt_text']}]({img['url']})"
+                        )
 
                 # PREPEND links before code output, cap code output to 50KB
                 if link_sections:
                     code_output = result.stdout[:50000]
-                    result.stdout = '\n'.join(link_sections) + '\n\n---\n\n' + code_output
+                    result.stdout = (
+                        '\n'.join(link_sections) + '\n\n---\n\n' + code_output
+                    )
+
+                logger.info(
+                    f"File URLs prepended: "
+                    f"downloads={len(non_image_downloads)}, "
+                    f"images={len(result.inline_images)}, "
+                    f"stdout_len={len(result.stdout)}"
+                )
 
             except Exception as e:
                 logger.error(f"File storage failed (non-fatal): {e}", exc_info=True)
