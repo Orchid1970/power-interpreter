@@ -178,21 +178,34 @@ class ChartCapture:
         except Exception as e:
             logger.error(f"Auto-capture of unclosed figures failed: {e}")
 
-    def make_savefig_wrapper(self, original_savefig):
+        def make_savefig_wrapper(self, original_savefig):
         capture = self
 
         def _tracking_savefig(self_fig, fname, *args, **kwargs):
             result = original_savefig(self_fig, fname, *args, **kwargs)
             try:
-                fname_path = Path(str(fname))
-                if fname_path.suffix.lower() in IMAGE_EXTENSIONS:
+                fname_str = str(fname)
+                fname_path = Path(fname_str)
+                ext = fname_path.suffix.lower()
+
+                if ext in IMAGE_EXTENSIONS or ext in STORABLE_EXTENSIONS:
+                    # Track relative paths
                     if not fname_path.is_absolute():
-                        rel_name = str(fname_path)
-                        if rel_name not in capture._savefig_tracked:
-                            capture._savefig_tracked.add(rel_name)
+                        rel_name = fname_str
+                    else:
+                        # For absolute paths inside session_dir, store relative
+                        try:
+                            rel_name = str(fname_path.relative_to(capture.session_dir))
+                        except ValueError:
+                            rel_name = fname_str
+
+                    if rel_name not in capture._savefig_tracked:
+                        capture._savefig_tracked.add(rel_name)
+                        logger.info(f"savefig tracked: {rel_name}")
+                        if ext in IMAGE_EXTENSIONS:
                             capture.captured_charts.append(rel_name)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"savefig tracking failed: {e}")
             return result
 
         return _tracking_savefig
