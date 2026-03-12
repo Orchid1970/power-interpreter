@@ -119,7 +119,7 @@ async def _cleanup_expired_sandbox_files():
             result = await session.execute(
                 delete(SandboxFile).where(
                     SandboxFile.expires_at != None,
-                    SandboxFile.expires_at < datetime.now(timezone.utc)
+                    SandboxFile.expires_at < datetime.utcnow()
                 )
             )
             if result.rowcount:
