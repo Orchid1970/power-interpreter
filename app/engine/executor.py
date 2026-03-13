@@ -10,6 +10,7 @@ import time
 import traceback
 import tempfile
 import hashlib
+import shutil
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, Tuple, List
@@ -47,22 +48,21 @@ MATPLOTLIB_USE_PATTERN = re_module.compile(
 )
 
 # Deprecated pandas frequency aliases (pandas 2.x)
-# LLMs frequently generate the old aliases which raise ValueError at runtime
 DEPRECATED_FREQ_ALIASES = {
-    'M': 'ME',    # Month end
-    'Y': 'YE',    # Year end
-    'A': 'YE',    # Annual (old alias for year end)
-    'Q': 'QE',    # Quarter end
-    'H': 'h',     # Hour (case change)
-    'T': 'min',   # Minute
-    'S': 's',     # Second (case change)
-    'L': 'ms',    # Millisecond
-    'U': 'us',    # Microsecond
-    'N': 'ns',    # Nanosecond
-    'BM': 'BME',  # Business month end
-    'BY': 'BYE',  # Business year end
-    'BQ': 'BQE',  # Business quarter end
-    'BA': 'BYE',  # Business annual
+    'M': 'ME',
+    'Y': 'YE',
+    'A': 'YE',
+    'Q': 'QE',
+    'H': 'h',
+    'T': 'min',
+    'S': 's',
+    'L': 'ms',
+    'U': 'us',
+    'N': 'ns',
+    'BM': 'BME',
+    'BY': 'BYE',
+    'BQ': 'BQE',
+    'BA': 'BYE',
 }
 
 REDIRECT_PATH_PREFIXES = ('/tmp/', '/temp/', '/var/tmp/')
@@ -128,6 +128,10 @@ class ExecutionResult:
             return str(self.result)[:settings.MAX_OUTPUT_SIZE]
 
 
+# =============================================================================
+# CHART CAPTURE — Fixed: make_savefig_wrapper is now a proper class method
+# =============================================================================
+
 class ChartCapture:
     def __init__(self, session_dir: Path):
         self.session_dir = session_dir
@@ -158,7 +162,51 @@ class ChartCapture:
 
         return _capturing_show
 
+    def make_savefig_wrapper(self, original_savefig):
+        """Wrap Figure.savefig to track files saved by user code.
+
+        FIX: This was previously nested inside capture_unclosed_figures
+        due to an indentation error, making it inaccessible as a class method.
+        Now it's a proper method on ChartCapture.
+        """
+        capture = self
+
+        def _tracking_savefig(self_fig, fname, *args, **kwargs):
+            result = original_savefig(self_fig, fname, *args, **kwargs)
+            try:
+                fname_str = str(fname)
+                fname_path = Path(fname_str)
+                ext = fname_path.suffix.lower()
+
+                if ext in IMAGE_EXTENSIONS or ext in STORABLE_EXTENSIONS:
+                    if not fname_path.is_absolute():
+                        rel_name = fname_str
+                    else:
+                        try:
+                            rel_name = str(fname_path.relative_to(capture.session_dir))
+                        except ValueError:
+                            # File saved outside session dir — copy it in
+                            if fname_path.exists():
+                                dest = capture.session_dir / fname_path.name
+                                shutil.copy2(str(fname_path), str(dest))
+                                rel_name = fname_path.name
+                                logger.info(f"savefig: copied {fname_path} -> {dest}")
+                            else:
+                                rel_name = fname_str
+
+                    if rel_name not in capture._savefig_tracked:
+                        capture._savefig_tracked.add(rel_name)
+                        logger.info(f"savefig tracked: {rel_name}")
+                        if ext in IMAGE_EXTENSIONS:
+                            capture.captured_charts.append(rel_name)
+            except Exception as e:
+                logger.warning(f"savefig tracking failed: {e}")
+            return result
+
+        return _tracking_savefig
+
     def capture_unclosed_figures(self, plt_module):
+        """Auto-capture any matplotlib figures that weren't explicitly saved or shown."""
         try:
             fig_nums = plt_module.get_fignums()
             if not fig_nums:
@@ -177,38 +225,6 @@ class ChartCapture:
             plt_module.close('all')
         except Exception as e:
             logger.error(f"Auto-capture of unclosed figures failed: {e}")
-
-        def make_savefig_wrapper(self, original_savefig):
-            capture = self
-
-        def _tracking_savefig(self_fig, fname, *args, **kwargs):
-            result = original_savefig(self_fig, fname, *args, **kwargs)
-            try:
-                fname_str = str(fname)
-                fname_path = Path(fname_str)
-                ext = fname_path.suffix.lower()
-
-                if ext in IMAGE_EXTENSIONS or ext in STORABLE_EXTENSIONS:
-                    # Track relative paths
-                    if not fname_path.is_absolute():
-                        rel_name = fname_str
-                    else:
-                        # For absolute paths inside session_dir, store relative
-                        try:
-                            rel_name = str(fname_path.relative_to(capture.session_dir))
-                        except ValueError:
-                            rel_name = fname_str
-
-                    if rel_name not in capture._savefig_tracked:
-                        capture._savefig_tracked.add(rel_name)
-                        logger.info(f"savefig tracked: {rel_name}")
-                        if ext in IMAGE_EXTENSIONS:
-                            capture.captured_charts.append(rel_name)
-            except Exception as e:
-                logger.warning(f"savefig tracking failed: {e}")
-            return result
-
-        return _tracking_savefig
 
 
 def _is_allowed_read_path(filepath: str) -> bool:
@@ -231,13 +247,7 @@ def _redirect_path(filepath: str, session_dir: Path) -> str:
 # =============================================================================
 
 class SessionSequencer:
-    """Manages ordered execution of sequenced calls within a session.
-
-    When multiple execute_code calls arrive simultaneously with sequence numbers,
-    this ensures they execute in order: sequence=1 first, then 2, then 3, etc.
-
-    Calls without sequence numbers bypass the sequencer entirely.
-    """
+    """Manages ordered execution of sequenced calls within a session."""
 
     def __init__(self):
         self._condition: Optional[asyncio.Condition] = None
@@ -252,8 +262,6 @@ class SessionSequencer:
         return self._condition
 
     async def wait_for_turn(self, sequence: int, timeout: float = 120.0):
-        """Wait until all sequences < this one have completed."""
-        # If sequence=1 arrives, reset state for a new batch
         if sequence == 1:
             self._completed.clear()
             self._expected_max = 0
@@ -279,18 +287,14 @@ class SessionSequencer:
                 )
 
     async def mark_completed(self, sequence: int):
-        """Mark a sequence number as done and notify waiters."""
         self._completed.add(sequence)
         async with self.condition:
             self.condition.notify_all()
 
-        # Only deactivate batch flag when all expected steps are done
-        # Do NOT clear the completed set — let wait_for_turn(1) do that
         if self._expected_max > 0 and len(self._completed) >= self._expected_max:
             self._active_batch = False
 
     async def wait_for_batch_clear(self, timeout: float = 120.0):
-        """For non-sequenced calls: wait until any active batch finishes."""
         if not self._active_batch:
             return
         async with self.condition:
@@ -302,7 +306,7 @@ class SessionSequencer:
             except asyncio.TimeoutError:
                 logger.warning("Non-sequenced call timed out waiting for batch. Proceeding.")
 
-                
+
 class SandboxExecutor:
     def __init__(self, sandbox_dir: Path = None):
         self.sandbox_dir = sandbox_dir or settings.SANDBOX_DIR
@@ -555,7 +559,7 @@ class SandboxExecutor:
             else:
                 import importlib
                 return importlib.import_module(module_name)
-        except ImportError as e:            
+        except ImportError as e:
             logger.warning(f"Module {module_name} not available: {e}")
             return None
 
@@ -614,23 +618,12 @@ class SandboxExecutor:
         return sandbox_globals
 
     def _patch_common_llm_mistakes(self, code: str) -> str:
-        """Fix common LLM code-generation errors before execution.
-
-        Catches known patterns where LLMs generate deprecated or incorrect
-        Python code, and silently corrects them to working equivalents.
-
-        Currently handles:
-          - pandas 2.x deprecated frequency aliases (freq='M' → freq='ME', etc.)
-          - urllib.request.request() → urllib.request.urlopen()
-        """
         patched = code
 
-        # --- Issue 5: pandas deprecated freq aliases (pandas 2.x) -----------
-        # Matches: freq='M', freq="M", freq = 'Q', etc.
         def _fix_freq_arg(m):
-            prefix = m.group(1)   # 'freq=' with optional whitespace
-            quote_char = m.group(2)    # quote character (' or ")
-            alias = m.group(3)    # the frequency alias
+            prefix = m.group(1)
+            quote_char = m.group(2)
+            alias = m.group(3)
             if alias in DEPRECATED_FREQ_ALIASES:
                 replacement = DEPRECATED_FREQ_ALIASES[alias]
                 logger.debug(f"LLM patch: freq='{alias}' → freq='{replacement}'")
@@ -643,12 +636,11 @@ class SandboxExecutor:
             patched
         )
 
-        # Matches: .resample('M'), .resample("Q"), etc.
         def _fix_resample_arg(m):
-            prefix = m.group(1)        # '.resample('
-            quote_char = m.group(2)    # quote character
-            alias = m.group(3)         # the frequency alias
-            suffix = m.group(4)        # closing paren area
+            prefix = m.group(1)
+            quote_char = m.group(2)
+            alias = m.group(3)
+            suffix = m.group(4)
             if alias in DEPRECATED_FREQ_ALIASES:
                 replacement = DEPRECATED_FREQ_ALIASES[alias]
                 logger.debug(f"LLM patch: resample('{alias}') → resample('{replacement}')")
@@ -661,7 +653,6 @@ class SandboxExecutor:
             patched
         )
 
-        # Matches: .asfreq('M'), .asfreq("Q"), etc.
         def _fix_asfreq_arg(m):
             prefix = m.group(1)
             quote_char = m.group(2)
@@ -679,7 +670,6 @@ class SandboxExecutor:
             patched
         )
 
-        # --- Issue 6: urllib.request.request() → urllib.request.urlopen() ----
         if 'urllib.request.request(' in patched:
             patched = patched.replace('urllib.request.request(', 'urllib.request.urlopen(')
             logger.debug("LLM patch: urllib.request.request() → urllib.request.urlopen()")
@@ -771,7 +761,6 @@ class SandboxExecutor:
                     assignments.append(f"{alias} = {alias}")
                 else:
                     resolved = False
-                    # Try importing as a submodule first
                     try:
                         submod = self._lazy_import(f"{module_name}.{name}")
                         if submod is not None:
@@ -781,7 +770,6 @@ class SandboxExecutor:
                     except Exception:
                         pass
 
-                    # Fallback: re-import parent with importlib and getattr
                     if not resolved:
                         try:
                             import importlib
@@ -810,8 +798,8 @@ class SandboxExecutor:
             import matplotlib.figure
             original_savefig = matplotlib.figure.Figure.savefig
             matplotlib.figure.Figure.savefig = chart_capture.make_savefig_wrapper(original_savefig)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to install savefig hook: {e}")
 
     def _make_path_normalizer(self, session_dir: Path):
         def _normalize_path(filepath: str) -> str:
@@ -883,7 +871,6 @@ class SandboxExecutor:
                     }
                     mime_type = mime_type_map.get(ext, 'application/octet-stream')
 
-                    # Use naive UTC datetimes to match the model's server_default
                     now_utc = datetime.utcnow()
 
                     sandbox_file = SandboxFile(
@@ -933,17 +920,6 @@ class SandboxExecutor:
     async def execute(self, code: str, session_id: str = "default",
                       timeout: int = None, context: Dict = None,
                       sequence: Optional[int] = None) -> ExecutionResult:
-        """Execute code in a sandboxed environment with session persistence.
-
-        Args:
-            code: Python code to execute
-            session_id: Session identifier for kernel persistence
-            timeout: Max execution time in seconds
-            context: Optional context dict
-            sequence: Optional step number for ordered execution (1, 2, 3...).
-                      When multiple calls arrive simultaneously with sequence numbers,
-                      they execute in order. 0 or None = no ordering (backward compatible).
-        """
         result = ExecutionResult()
 
         raw_timeout = timeout
@@ -954,7 +930,6 @@ class SandboxExecutor:
         session_dir = self.sandbox_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        # Normalize sequence: 0 or negative = no sequencing
         effective_sequence = sequence if (sequence and sequence > 0) else None
 
         sequencer = self._get_sequencer(session_id)
@@ -980,7 +955,6 @@ class SandboxExecutor:
     async def _execute_locked(self, code: str, session_id: str, session_dir: Path,
                                timeout: int, result: ExecutionResult,
                                context: Dict = None) -> ExecutionResult:
-        """Core execution logic, called while holding the async lock."""
 
         if kernel_manager.has_session(session_id):
             sandbox_globals = kernel_manager.get_or_create(
@@ -1016,12 +990,22 @@ class SandboxExecutor:
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
 
+        # ── Snapshot files BEFORE execution ──
         files_before = set()
+        tmp_files_before = set()
         if session_dir.exists():
             try:
                 files_before = set(str(p) for p in session_dir.rglob('*') if p.is_file())
             except Exception:
                 pass
+        # Also snapshot /tmp so we can detect files saved there
+        try:
+            tmp_files_before = set(
+                str(p) for p in Path('/tmp').iterdir()
+                if p.is_file() and p.suffix.lower() in STORABLE_EXTENSIONS
+            )
+        except Exception:
+            pass
 
         start_time = time.time()
 
@@ -1096,7 +1080,7 @@ class SandboxExecutor:
                 except Exception:
                     result.memory_used_mb = 0.0
 
-            # ── File detection: compare before/after ──
+            # ── File detection: compare before/after in session_dir ──
             new_files_from_diff = set()
             if session_dir.exists():
                 try:
@@ -1114,8 +1098,47 @@ class SandboxExecutor:
                 if tracked_path.exists():
                     savefig_files.add(str(tracked_path))
 
+            # ── RESCUE: Check /tmp for new storable files ──
+            tmp_rescued = set()
+            try:
+                tmp_files_after = set(
+                    str(p) for p in Path('/tmp').iterdir()
+                    if p.is_file() and p.suffix.lower() in STORABLE_EXTENSIONS
+                )
+                new_tmp_files = tmp_files_after - tmp_files_before
+                for tmp_file_str in new_tmp_files:
+                    tmp_path = Path(tmp_file_str)
+                    if tmp_path.exists() and tmp_path.stat().st_size > 0:
+                        dest = session_dir / tmp_path.name
+                        # Avoid overwriting if name collision
+                        if dest.exists():
+                            stem = dest.stem
+                            ext = dest.suffix
+                            dest = session_dir / f"{stem}_{uuid.uuid4().hex[:6]}{ext}"
+                        shutil.copy2(str(tmp_path), str(dest))
+                        tmp_rescued.add(str(dest))
+                        logger.info(f"Rescued file from /tmp: {tmp_path.name} -> {dest.name}")
+            except Exception as e:
+                logger.warning(f"/tmp rescue scan failed: {e}")
+
+            # ── RESCUE: Check CWD if it differs from session_dir ──
+            cwd_rescued = set()
+            try:
+                current_cwd = Path(os.getcwd())
+                if current_cwd.resolve() != session_dir.resolve():
+                    for f in current_cwd.iterdir():
+                        if f.is_file() and f.suffix.lower() in STORABLE_EXTENSIONS:
+                            if str(f) not in files_before:
+                                dest = session_dir / f.name
+                                if not dest.exists():
+                                    shutil.copy2(str(f), str(dest))
+                                    cwd_rescued.add(str(dest))
+                                    logger.info(f"Rescued file from CWD: {f.name} -> {dest.name}")
+            except Exception as e:
+                logger.warning(f"CWD rescue scan failed: {e}")
+
             # ── Merge all detected files ──
-            all_new_files = new_files_from_diff | savefig_files
+            all_new_files = new_files_from_diff | savefig_files | tmp_rescued | cwd_rescued
             result.files_created = [
                 str(Path(f).relative_to(session_dir))
                 for f in all_new_files
@@ -1127,6 +1150,8 @@ class SandboxExecutor:
                 f"charts={len(chart_capture.captured_charts)}, "
                 f"savefig_tracked={len(chart_capture._savefig_tracked)}, "
                 f"diff_new={len(new_files_from_diff)}, "
+                f"tmp_rescued={len(tmp_rescued)}, "
+                f"cwd_rescued={len(cwd_rescued)}, "
                 f"files_created={len(result.files_created)}: "
                 f"{result.files_created[:5]}"
             )
@@ -1151,7 +1176,6 @@ class SandboxExecutor:
 
                 non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
 
-                # Build download link sections
                 link_sections = []
 
                 if non_image_downloads:
@@ -1173,7 +1197,6 @@ class SandboxExecutor:
                             f"\n![{img['alt_text']}]({img['url']})"
                         )
 
-                # PREPEND links before code output, cap code output to 50KB
                 if link_sections:
                     code_output = result.stdout[:50000]
                     result.stdout = (
@@ -1191,7 +1214,6 @@ class SandboxExecutor:
                 logger.error(f"File storage failed (non-fatal): {e}", exc_info=True)
 
         return result
-
 
 
 executor = SandboxExecutor()
