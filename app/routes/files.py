@@ -26,12 +26,12 @@ from urllib.parse import quote
 
 from app.config import settings
 
-logger = logging.getLogger(__name__)
+logger = logging.Logger(__name__)
 
 router = APIRouter()
 
 # Separate router for public download (no API key required)
-# This gets mounted at /dl in main.py
+# This s mounted at /dl in main.py
 public_router = APIRouter()
 
 SANDBOX_DIR = settings.SANDBOX_DIR
@@ -46,7 +46,7 @@ MAX_FETCH_SIZE = 500 * 1024 * 1024   # 500MB for URL fetches
 # ============================================================
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Methods": ", HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Type, X-Session-Id",
     "Access-Control-Max-Age": "3600",
@@ -156,7 +156,7 @@ def _safe_filename(filename: str) -> str:
     return name
 
 
-def _get_preview(file_path: Path, max_lines: int = 5) -> Optional[str]:
+def __preview(file_path: Path, max_lines: int = 5) -> Optional[str]:
     """Get a text preview of a file"""
     try:
         suffix = file_path.suffix.lower()
@@ -251,13 +251,21 @@ async def _serve_download(file_id: str, head_only: bool = False) -> Response:
             safe_name = sandbox_file.filename
             encoded_name = quote(safe_name)
             ascii_name = safe_name.encode('ascii', 'replace').decode('ascii')
-            disposition = (
-                f'attachment; '
-                f'filename="{ascii_name}"; '
-                f"filename*=UTF-8''{encoded_name}"
-            )
-
             mime = sandbox_file.mime_type or 'application/octet-stream'
+            IMAGE_MIME_TYPES = {'image/png', 'image/jpeg', 'image/jpg', 'image/svg+xml', 'image/gif', 'image/webp'}
+      if mime in IMAGE_MIME_TYPES:
+        disposition = (
+          f'inline; '
+          f'filename="{ascii_name}"; '
+          f'filename*=UTF-8\'\'{encoded_name}'
+        )
+      else:
+        disposition = (
+          f'attachment; '
+          f'filename="{ascii_name}"; '
+          f'filename*=UTF-8\'\'{encoded_name}'
+        )
+
 
             logger.info(
                 f"download: {sandbox_file.filename} "
