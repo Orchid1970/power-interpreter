@@ -253,18 +253,18 @@ async def _serve_download(file_id: str, head_only: bool = False) -> Response:
             ascii_name = safe_name.encode('ascii', 'replace').decode('ascii')
             mime = sandbox_file.mime_type or 'application/octet-stream'
             IMAGE_MIME_TYPES = {'image/png', 'image/jpeg', 'image/jpg', 'image/svg+xml', 'image/gif', 'image/webp'}
-      if mime in IMAGE_MIME_TYPES:
-        disposition = (
-          f'inline; '
-          f'filename="{ascii_name}"; '
-          f'filename*=UTF-8\'\'{encoded_name}'
-        )
-      else:
-        disposition = (
-          f'attachment; '
-          f'filename="{ascii_name}"; '
-          f'filename*=UTF-8\'\'{encoded_name}'
-        )
+            if mime in IMAGE_MIME_TYPES:
+              disposition = (
+                f'inline; '
+                f'filename="{ascii_name}"; '
+                f'filename*=UTF-8\'\'{encoded_name}'
+              )
+            else:
+              disposition = (
+                f'attachment; '
+                f'filename="{ascii_name}"; '
+                f'filename*=UTF-8\'\'{encoded_name}'
+                )
 
 
             logger.info(
