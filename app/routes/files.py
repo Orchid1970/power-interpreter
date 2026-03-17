@@ -371,7 +371,7 @@ async def upload_file(request: UploadFileRequest):
     logger.info(f"upload_file: saved {safe_name} ({len(file_bytes)} bytes) "
                 f"to {file_path}")
 
-    preview = _get_preview(file_path)
+    preview = __preview(file_path)
 
     return FileInfo(
         filename=safe_name,
@@ -488,7 +488,7 @@ async def fetch_file(request: FetchFileRequest):
     logger.info(f"fetch_file: downloaded {safe_name} ({file_size} bytes) "
                 f"from {request.url[:80]}")
 
-    preview = _get_preview(file_path)
+    preview = __preview(file_path)
 
     return FileInfo(
         filename=safe_name,
@@ -525,7 +525,7 @@ async def list_files(session_id: Optional[str] = None):
                         size_human=_human_size(size),
                         mime_type=_detect_mime_type(file_path.name),
                         session_id=session_id,
-                        preview=_get_preview(file_path)
+                        preview=__preview(file_path)
                     ))
     else:
         if SANDBOX_DIR.exists():
@@ -543,7 +543,7 @@ async def list_files(session_id: Optional[str] = None):
                                 size_human=_human_size(size),
                                 mime_type=_detect_mime_type(file_path.name),
                                 session_id=sid,
-                                preview=_get_preview(file_path)
+                                preview=__preview(file_path)
                             ))
 
     return FileListResponse(
