@@ -1,5 +1,5 @@
 """Power Interpreter MCP Server - Tool definitions for SimTheory.ai
-Version: 2.9.6 — Hybrid image delivery (markdown URLs + base64 ImageContent)
+Version: 3.0.3 — Guard integrations (syntax, context, response, budget)
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -10,6 +10,10 @@ import json
 import logging
 import base64
 import re
+
+from app.response_guard import smart_truncate
+from app.response_budget import enforce_response_budget
+from app.context_guard import get_effective_cap, maybe_add_pressure_warning
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +302,8 @@ async def execute_code(
                 json=payload
             )
             blocks = _build_content_blocks(resp.text)
-            return await _enrich_blocks_with_images(blocks, resp.text)
+            blocks = await _enrich_blocks_with_images(blocks, resp.text)
+            return _apply_guards("execute_code", blocks)
     except httpx.TimeoutException:
         return [{"type": "text", "text": f"execute_code HTTP timeout after {max(timeout + 15, 120)}s. Try submit_job for long tasks."}]
     except Exception as e:
@@ -399,7 +404,8 @@ async def get_job_result(job_id: str) -> list:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(f"{API_BASE}/api/jobs/{job_id}/result", headers=_headers())
             blocks = _build_content_blocks(resp.text)
-            return await _enrich_blocks_with_images(blocks, resp.text)
+            blocks = await _enrich_blocks_with_images(blocks, resp.text)
+            return _apply_guards("get_job_result", blocks)
     except Exception as e:
         return [{"type": "text", "text": f"get_job_result error: {e}"}]
 
@@ -455,6 +461,23 @@ async def create_session(name: str, description: str = "") -> str:
             return resp.text
     except Exception as e:
         return f"create_session error: {e}"
+
+
+# ============================================================
+# GUARD PIPELINE
+# ============================================================
+
+def _apply_guards(tool_name: str, blocks: list) -> list:
+    """Apply response guards: smart truncation, context pressure, budget enforcement."""
+    for i, block in enumerate(blocks):
+        if block.get("type") == "text":
+            text = block["text"]
+            cap = get_effective_cap(tool_name)
+            text = smart_truncate(text, max_chars=cap)
+            text = maybe_add_pressure_warning(tool_name, text)
+            blocks[i] = {"type": "text", "text": text}
+    result = enforce_response_budget(tool_name, blocks)
+    return result if isinstance(result, list) else blocks
 
 
 # ============================================================
