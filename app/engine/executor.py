@@ -22,6 +22,8 @@ from urllib.parse import quote
 
 from app.config import settings
 from app.engine.kernel_manager import kernel_manager
+from app.syntax_guard import check_syntax as _syntax_check
+from app.context_guard import truncate_stdout as _truncate_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -631,7 +633,7 @@ class SandboxExecutor:
             return m.group(0)
 
         patched = re_module.sub(
-            r"""(freq\s*=\s*)(['"])([A-Z]{1,2})\2""",
+            r"""(freq\s*=\s*)(['\"])([A-Z]{1,2})\2""",
             _fix_freq_arg,
             patched
         )
@@ -648,7 +650,7 @@ class SandboxExecutor:
             return m.group(0)
 
         patched = re_module.sub(
-            r"""(\.resample\(\s*)(['"])([A-Z]{1,2})\2(\s*\))""",
+            r"""(\.resample\(\s*)(['\"])([A-Z]{1,2})\2(\s*\))""",
             _fix_resample_arg,
             patched
         )
@@ -665,7 +667,7 @@ class SandboxExecutor:
             return m.group(0)
 
         patched = re_module.sub(
-            r"""(\.asfreq\(\s*)(['"])([A-Z]{1,2})\2(\s*\))""",
+            r"""(\.asfreq\(\s*)(['\"])([A-Z]{1,2})\2(\s*\))""",
             _fix_asfreq_arg,
             patched
         )
@@ -974,6 +976,14 @@ class SandboxExecutor:
         sandbox_globals['__normalize_path'] = self._make_path_normalizer(session_dir)
         self._install_pandas_path_hooks(sandbox_globals, session_dir)
 
+        # ── Pre-execution syntax guard ──
+        syntax_error = _syntax_check(code)
+        if syntax_error:
+            result.success = False
+            result.error_message = syntax_error
+            logger.info(f"Syntax guard rejected code: {syntax_error[:120]}")
+            return result
+
         try:
             code = self._patch_common_llm_mistakes(code)
             processed_code = self._preprocess_code(code, sandbox_globals)
@@ -1067,7 +1077,7 @@ class SandboxExecutor:
         finally:
             end_time = time.time()
             result.execution_time_ms = int((end_time - start_time) * 1000)
-            result.stdout = stdout_capture.getvalue()
+            result.stdout = _truncate_stdout(stdout_capture.getvalue())
             result.stderr = stderr_capture.getvalue()
 
             if result.error_message:
