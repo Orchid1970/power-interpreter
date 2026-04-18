@@ -2,23 +2,55 @@
 Version: see app/version.py
 """
 
-import logging
-import asyncio
-import json
-import inspect
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from fastapi import FastAPI, Depends, Request
-from fastapi.responses import Response, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+# =============================================================================
+# EARLY STDERR CAPTURE  (must run before ANY other imports)
+# =============================================================================
+# FastMCP installs Rich's RichHandler on a logger during its own module
+# import. RichHandler (via Rich's Console) grabs sys.stderr at __init__
+# time and holds a direct reference to it. When app/mcp_server.py's
+# module-level code runs logger.info() during
+# "from app.mcp_server import mcp", the banner ("MCP Server:
+# API_BASE=...", "Microsoft integration: DISABLED", etc.) is written
+# directly to that captured stderr reference -- BEFORE setup_logging()
+# has a chance to run. Cloud log parsers like Railway then classify
+# those records as "error" severity.
+#
+# We fix this by redirecting sys.stderr to an in-memory buffer BEFORE
+# any imports run. Libraries that capture sys.stderr during import
+# capture our buffer, not the real stderr. After imports finish and
+# setup_logging() has neutralized all third-party handlers, we restore
+# real sys.stderr and re-emit the captured text through the correctly-
+# routed logger so the banner still appears in the log stream, but at
+# the correct INFO severity (stdout).
+import sys
+import io
 
-from app.version import __version__
-from app.config import settings
-from app.auth import verify_api_key
-from app.routes import execute, jobs, files, data, sessions, health
-from app.routes.files import public_router as download_router
-from app.mcp_server import mcp
-from app.logging_config import setup_logging
+_original_stderr = sys.stderr
+_stderr_buffer = io.StringIO()
+sys.stderr = _stderr_buffer
+
+try:
+    import logging
+    import asyncio
+    import json
+    import inspect
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    from fastapi import FastAPI, Depends, Request
+    from fastapi.responses import Response, JSONResponse
+    from fastapi.middleware.cors import CORSMiddleware
+
+    from app.version import __version__
+    from app.config import settings
+    from app.auth import verify_api_key
+    from app.routes import execute, jobs, files, data, sessions, health
+    from app.routes.files import public_router as download_router
+    from app.mcp_server import mcp
+    from app.logging_config import setup_logging
+finally:
+    # Restore real stderr BEFORE setup_logging so any subsequent
+    # ERROR/CRITICAL records correctly route to the real stderr.
+    sys.stderr = _original_stderr
 
 # Configure logging AFTER all imports so we can override any handlers
 # installed by third-party libraries (e.g., FastMCP's RichHandler, which
@@ -26,6 +58,18 @@ from app.logging_config import setup_logging
 # cloud log parsers like Railway).
 setup_logging(settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+# Re-emit any text captured from stderr during imports through the now-
+# correctly-configured logger. This is typically FastMCP's startup
+# banner. Routing via logger.info() sends it to stdout (INFO severity)
+# instead of stderr (error severity).
+_captured_banner = _stderr_buffer.getvalue()
+if _captured_banner.strip():
+    for line in _captured_banner.splitlines():
+        cleaned = line.rstrip()
+        if cleaned:
+            logger.info(cleaned)
+del _stderr_buffer
 
 
 def _safe_log_preview(result, max_len: int = 300) -> str:
