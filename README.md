@@ -8,21 +8,19 @@ Built for [SimTheory.ai](https://simtheory.ai) — execute Python code, load dat
 
 ## Version
 
-**v2.9.2** — LLM code-correction layer, `requests` library added to sandbox, pandas 2.x frequency alias auto-patching, urllib method name correction.
+**v3.0.3** — Execution guard foundation: context pressure guard, pre-execution syntax guard, response guard, and response budget. Microsoft 365 (OneDrive / SharePoint) integrations removed from core; this repository is now a pure personal / practical sandbox focused on code execution, data analysis, and chart generation.
 
 ---
 
 ## Positioning
 
-Power Interpreter is optimized first for **personal and practical AI workflows**:
+Power Interpreter is optimized for **personal and practical AI workflows**:
 
 - Python / code execution in a persistent sandbox
 - Spreadsheet and dataset analysis (CSV, Excel, JSON, Parquet, PDF)
 - Chart generation (matplotlib, seaborn, plotly)
 - File export and persistent download URLs
 - Persistent working sessions across tool calls
-
-Cloud storage integrations (OneDrive, SharePoint) are available as **optional convenience layers** when environment credentials are configured. They are not required for core functionality.
 
 ---
 
@@ -37,11 +35,10 @@ SimTheory.ai (MCP Client)
 │                                              │
 │  ┌──────────────┐  ┌──────────────────────┐  │
 │  │ MCP Server   │  │ FastAPI Routes       │  │
-│  │ (base tools  │──│ /api/execute         │  │
-│  │  + optional  │  │ /api/data/load       │  │
-│  │  cloud       │  │ /api/files/*         │  │
-│  │  integrations│  │ /api/jobs/*          │  │
-│  │  )           │  │                      │  │
+│  │ (base tools) │──│ /api/execute         │  │
+│  │              │  │ /api/data/load       │  │
+│  │              │  │ /api/files/*         │  │
+│  │              │  │ /api/jobs/*          │  │
 │  └──────────────┘  └──────────────────────┘  │
 │         │                    │                │
 │         ▼                    ▼                │
@@ -75,10 +72,6 @@ SimTheory.ai (MCP Client)
 | `list_datasets` | List all datasets in PostgreSQL |
 | `create_session` | Create isolated workspace session |
 
-### Optional Integrations
-
-Microsoft 365 (OneDrive / SharePoint) tools are available when `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET`, and `MICROSOFT_TENANT_ID` environment variables are configured. These are not required for core operation.
-
 ---
 
 ## Supported Data Formats
@@ -107,7 +100,18 @@ All formats are loaded into PostgreSQL in 50K-row chunks with automatic indexing
 
 ## Sandbox Features
 
-### LLM Code Correction Layer (v2.9.2)
+### Execution Guard Foundation (v3.0.x)
+
+A layered set of pre- and post-execution guardrails that stabilize runtime behavior and bound output size:
+
+| Guard | Module | Purpose |
+|-------|--------|---------|
+| Context pressure guard | `app/context_guard.py` | Protects against oversized tool output / context overflow |
+| Pre-execution syntax guard | `app/syntax_guard.py` | Catches syntax issues before code is handed to the kernel |
+| Response guard | `app/response_guard.py` | Final output guardrails (boundary-aware truncation, safe error shapes) |
+| Response budget | `app/response_budget.py` | Bounds total response size so downstream agents stay within context |
+
+### LLM Code Correction Layer
 
 The executor includes a pre-execution patching step (`_patch_common_llm_mistakes`) that silently corrects known LLM code-generation errors before the sandbox runs the code:
 
@@ -155,7 +159,7 @@ This layer also works with the import resolution system (`_handle_import_line`) 
 | xlsxwriter | | |
 | pdfplumber | | |
 | reportlab | | platypus, pdfgen sub-modules |
-| requests | | HTTP client (added v2.9.2) |
+| requests | | HTTP client |
 | warnings | | utility support |
 | abc | | abstract base classes |
 | enum | | enum support |
@@ -227,9 +231,6 @@ Deployed on **Railway** with:
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `API_KEY` | Yes | API key for protected endpoints |
 | `RAILWAY_PUBLIC_DOMAIN` | Auto | Set by Railway for public URLs |
-| `MICROSOFT_CLIENT_ID` | No | Optional Microsoft integration |
-| `MICROSOFT_CLIENT_SECRET` | No | Optional Microsoft integration |
-| `MICROSOFT_TENANT_ID` | No | Optional Microsoft integration |
 
 ### Configuration Defaults
 
@@ -257,6 +258,10 @@ power-interpreter/
 │   ├── auth.py                # API key authentication
 │   ├── database.py            # PostgreSQL connection management
 │   ├── models.py              # SQLAlchemy models
+│   ├── context_guard.py       # Context pressure guard
+│   ├── syntax_guard.py        # Pre-execution syntax guard
+│   ├── response_guard.py      # Output / response guardrails
+│   ├── response_budget.py     # Response size budgeting
 │   ├── engine/
 │   │   ├── data_manager.py    # Universal data loading (CSV/Excel/PDF/JSON/Parquet)
 │   │   ├── executor.py        # Sandboxed Python execution + LLM code correction
@@ -282,6 +287,11 @@ power-interpreter/
 
 | Version | Date | Component | Changes |
 |---------|------|-----------|---------|
+| **v3.0.3** | 2026-04-17 | release, docs, deps | Version bump to 3.0.3; Microsoft 365 (OneDrive / SharePoint) dependencies and environment variables removed from core; README and `.env.example` aligned to personal / practical sandbox scope |
+| **v3.0.2** | 2026-04 | guards, engine | Response budget + sandbox backpressure queue |
+| **v3.0.1** | 2026-04 | guards | Pre-execution syntax guard |
+| **v3.0.0** | 2026-04 | guards | Context pressure guard |
+| **v2.9.5** | 2026-03 | executor | Stability fixes and hardening |
 | **v2.9.2** | 2026-03-08 | executor, requirements, docs | LLM code-correction layer (`_patch_common_llm_mistakes`); `requests` library added to sandbox; pandas 2.x freq alias auto-patching; `urllib.request.request()` → `urlopen()` correction; `.asfreq()` patching |
 | **v2.9.1** | 2026-03-07 | main, start, docs | Centralized version constant; startup consistency; `datetime.utcnow()` replaced; docs refresh |
 | **v2.9.0** | 2026-03 | mcp_server | Trimmed all tool descriptions for token optimization (~57% reduction) |
@@ -294,8 +304,6 @@ power-interpreter/
 | **v2.8.0** | 2026-02-22 | executor | Defensive path normalization (doubled session prefix) |
 | **v2.7.0** | 2026-02-21 | executor | reportlab + matplotlib PDF backend allowlisted |
 | **v2.6** | 2026-02-20 | executor | Critical fix: matplotlib.pyplot alias override bug |
-| **v1.9.2** | 2026-02 | Microsoft auth | Token persistence rewrite (SQLAlchemy) |
-| **v1.9.0** | 2026-02 | Microsoft integration | OneDrive + SharePoint integration |
 | **v1.8.2** | 2026-02-23 | mcp_server | load_dataset description updated for universal format |
 | **v1.8.1** | 2026-02-23 | main, mcp_server | Chart serve route + base64 stdout regex fallback |
 | **v1.7.2** | 2026-02-22 | mcp_server | fetch_from_url route fix |
