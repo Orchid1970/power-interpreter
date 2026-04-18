@@ -1,8 +1,17 @@
-"""Microsoft 365 OneDrive & SharePoint integration for Power Interpreter.
+"""Microsoft integration package (disabled in Personal MCP).
 
-v1.9.2: Auth manager no longer requires db_pool. Uses SQLAlchemy directly.
+The Personal MCP is single-user and does not carry the full Microsoft
+365 / Graph integration that lives in the Work MCP. This package is
+retained only so that historical imports continue to resolve without
+raising ImportError.
+
+The only external contract preserved is::
+
+    from app.microsoft.bootstrap import init_microsoft_tools
+
+Everything else in this package is a stub.
 """
-from .graph_client import GraphClient
-from .auth_manager import MSAuthManager
 
-__all__ = ["GraphClient", "MSAuthManager"]
+from app.microsoft.bootstrap import init_microsoft_tools
+
+__all__ = ["init_microsoft_tools"]

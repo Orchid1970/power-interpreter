@@ -1,20 +1,22 @@
-"""DEPRECATED — This file is a redirect to app/microsoft/tools.py
+"""Microsoft MCP tools (intentionally stubbed).
 
-v1.9.4: Consolidated duplicate tool registration files.
-The canonical file is now app/microsoft/tools.py which contains:
-- 22 tools (was 21)
-- Optional user_id on all Microsoft tools (auto-resolves from auth)
-- New resolve_share_link tool for SharePoint/OneDrive sharing URLs
-
-bootstrap.py now imports directly from tools.py.
-This file exists only for backwards compatibility.
+The Personal MCP does not register any Microsoft tools. This module is
+retained as an empty placeholder so that any historical import such as
+`from app.microsoft.mcp_tools import register_microsoft_tools` resolves
+to a no-op rather than raising ImportError.
 """
 
 import logging
+from typing import Any
+
 logger = logging.getLogger(__name__)
-logger.warning("mcp_tools.py is DEPRECATED — use app.microsoft.tools instead")
 
-# Re-export for any stale imports
-from app.microsoft.tools import register_microsoft_tools
 
-__all__ = ["register_microsoft_tools"]
+def register_microsoft_tools(mcp: Any) -> None:
+    """No-op registration. Microsoft tools are disabled in Personal MCP.
+
+    Accepts `mcp` for signature compatibility with the Work MCP and
+    then does nothing.
+    """
+    logger.debug("register_microsoft_tools called but Microsoft is disabled")
+    return None
