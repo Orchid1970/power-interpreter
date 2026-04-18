@@ -18,12 +18,13 @@ from app.auth import verify_api_key
 from app.routes import execute, jobs, files, data, sessions, health
 from app.routes.files import public_router as download_router
 from app.mcp_server import mcp
+from app.logging_config import setup_logging
 
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL),
-    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# Configure logging AFTER all imports so we can override any handlers
+# installed by third-party libraries (e.g., FastMCP's RichHandler, which
+# writes to stderr and causes every log line to be tagged as "error" in
+# cloud log parsers like Railway).
+setup_logging(settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 
