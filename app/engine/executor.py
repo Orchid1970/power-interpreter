@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 from app.config import settings
 from app.engine.kernel_manager import kernel_manager
+from app.engine.session_store import session_store
 from app.syntax_guard import check_syntax as _syntax_check
 from app.context_guard import truncate_stdout as _truncate_stdout
 
@@ -931,6 +932,14 @@ class SandboxExecutor:
 
         session_dir = self.sandbox_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
+
+        # Register / refresh session in the async-native SessionStore BEFORE
+        # we acquire the per-session exec lock, so a long-running prior
+        # request still keeps the session alive against the TTL sweeper.
+        try:
+            await session_store.touch(session_id)
+        except Exception as e:
+            logger.warning(f"session_store.touch failed (non-fatal): {e}")
 
         effective_sequence = sequence if (sequence and sequence > 0) else None
 
