@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models import Job, JobStatus
 from app.engine.executor import executor, ExecutionResult
+from app.engine.user_tracker import user_tracker
 from app.database import get_session_factory
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,9 @@ class JobManager:
             session.add(job)
             await session.commit()
         
+        # P4: Record submission in user tracker (non-raising telemetry)
+        await user_tracker.record_job_submitted(job_id, session_id, metadata)
+        
         # Start execution in background
         task = asyncio.create_task(
             self._execute_job(job_id, code, session_id or "default", timeout, context)
@@ -120,6 +124,9 @@ class JobManager:
                 )
                 await session.commit()
             
+            # P4: Record start in user tracker (non-raising telemetry)
+            await user_tracker.record_job_started(job_id)
+            
             logger.info(f"Job {job_id} started execution")
             
             # Execute the code
@@ -153,6 +160,13 @@ class JobManager:
                     )
                     await session.commit()
                 
+                # P4: Record completion in user tracker (non-raising telemetry)
+                await user_tracker.record_job_completed(
+                    job_id,
+                    success=exec_result.success,
+                    duration_ms=exec_result.execution_time_ms,
+                )
+                
                 logger.info(
                     f"Job {job_id} completed: {status.value} "
                     f"({exec_result.execution_time_ms}ms)"
@@ -171,6 +185,13 @@ class JobManager:
                         )
                     )
                     await session.commit()
+                
+                # P4: Record failure in user tracker (non-raising telemetry)
+                await user_tracker.record_job_completed(
+                    job_id,
+                    success=False,
+                    duration_ms=None,
+                )
     
     async def get_job_status(self, job_id: str) -> Optional[Dict]:
         """Get current status of a job"""
@@ -247,6 +268,9 @@ class JobManager:
                     )
                 )
                 await session.commit()
+            
+            # P4: Record cancellation in user tracker (non-raising telemetry)
+            await user_tracker.record_job_cancelled(job_id)
             
             logger.info(f"Job {job_id} cancelled")
             return True
