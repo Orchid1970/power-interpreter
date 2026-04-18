@@ -46,6 +46,14 @@ def _safe_log_preview(result, max_len: int = 300) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Second logging setup pass, AFTER uvicorn has had a chance to
+    # install its own handlers on named loggers (uvicorn.error, etc.).
+    # setup_logging() is idempotent, so this just re-neutralizes any
+    # handlers that appeared between module import and server startup.
+    # Without this pass, "Application startup complete." and similar
+    # uvicorn INFO messages are still classified as error severity.
+    setup_logging(settings.LOG_LEVEL)
+
     logger.info(f"Power Interpreter MCP v{__version__} starting...")
     settings.ensure_directories()
 
