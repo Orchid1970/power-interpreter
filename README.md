@@ -288,11 +288,11 @@ power-interpreter/
 | Version | Date | Component | Changes |
 |---------|------|-----------|---------|
 | **v3.0.9** | 2026-04-19 | release, docs | Version bump to 3.0.9; README aligned to current v3.0.x guardrail foundation and cumulative release history |
-| **v3.0.8** | 2026-04 | guards, docs | Response guard refinement and documentation polish |
-| **v3.0.7** | 2026-04 | guards | Boundary-aware response truncation hardening |
-| **v3.0.6** | 2026-04 | guards | Safe error-shape stabilization for downstream agents |
-| **v3.0.5** | 2026-04 | guards | Response budget tuning and output bounding |
-| **v3.0.4** | 2026-04 | guards | Execution guard foundation follow-on hardening and integration cleanup |
+| **v3.0.8** | 2026-04-18 | session, executor | feat(session): async SessionStore with TTL sweeper (PR #8). New `app/engine/session_store.py` — async-native session lifecycle coordinator with 1h TTL, lazy-started background sweeper (5-min interval), `asyncio.Lock`-serialized state; evicts expired kernels via `kernel_manager.reset_session` after releasing its own lock. `app/engine/executor.py` awaits `session_store.touch(session_id)` on entry to `execute()`. `app/version.py` bumped 3.0.7 → 3.0.8 |
+| **v3.0.7** | 2026-04-18 | logging | fix(logging): capture stderr during imports to catch FastMCP banner. Wraps all imports in a try/finally that redirects `sys.stderr` to an `io.StringIO` buffer, then re-emits captured text through `logger.info()` after `setup_logging()` neutralizes handlers. Resolves the FastMCP banner (RichHandler captured stderr at `__init__` time) being classified as ERROR severity in Railway. This is the fix v3.0.6 was supposed to ship |
+| **v3.0.6** | 2026-04-18 | version | chore(version): bump to 3.0.6 intended to ship the stderr-capture fix for the FastMCP banner. Shipped as a no-op due to a SHA race — only the version bump landed; actual code fix is in v3.0.7 |
+| **v3.0.5** | 2026-04-18 | logging | fix(logging): neutralize named third-party loggers (Part 1) — extends `setup_logging()` to clear handlers from all existing named loggers (Tier 2) and pre-emptively neutralize `uvicorn`, `uvicorn.error`, `uvicorn.access`, `uvicorn.asgi`, `mcp`, `mcp.server`, `fastmcp`, `rich`, `fastapi`, `starlette`, `starlette.routing` (Tier 3). fix(logging): re-run `setup_logging()` in lifespan startup (Part 2) — catches uvicorn handlers installed on named loggers after module import |
+| **v3.0.4** | 2026-04-18 | logging | fix(logging): route INFO/WARNING to stdout, errors to stderr (PR #7). Replaces `logging.basicConfig()` with a severity-based stream routing module: new `app/logging_config.py` with `setup_logging()` + `MaxLevelFilter`. DEBUG/INFO/WARNING → stdout, ERROR/CRITICAL → stderr. Called after all imports to override FastMCP's RichHandler |
 | **v3.0.3** | 2026-04-17 | release, docs, deps | Version bump to 3.0.3; Microsoft 365 (OneDrive / SharePoint) dependencies and environment variables removed from core; README and `.env.example` aligned to personal / practical sandbox scope |
 | **v3.0.2** | 2026-04 | guards, engine | Response budget + sandbox backpressure queue |
 | **v3.0.1** | 2026-04 | guards | Pre-execution syntax guard |
