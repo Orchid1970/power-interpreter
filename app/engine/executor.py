@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 
 MIN_EXECUTION_TIMEOUT = 100
 
+# Module-level single-capture of the TRUE pandas originals. Initialised lazily
+# the first time _install_pandas_path_hooks runs. Without this, every per-call
+# wrap treated the already-wrapped function as the "original", producing
+# N-deep recursion chains (observed up to 13 deep in production traces).
+_PANDAS_ORIGINAL_READ_CSV = None
+_PANDAS_ORIGINAL_READ_EXCEL = None
+
 try:
     import resource as resource_module
     HAS_RESOURCE = True
@@ -132,7 +139,7 @@ class ExecutionResult:
 
 
 # =============================================================================
-# CHART CAPTURE — Fixed: make_savefig_wrapper is now a proper class method
+# CHART CAPTURE - Fixed: make_savefig_wrapper is now a proper class method
 # =============================================================================
 
 class ChartCapture:
@@ -188,7 +195,7 @@ class ChartCapture:
                         try:
                             rel_name = str(fname_path.relative_to(capture.session_dir))
                         except ValueError:
-                            # File saved outside session dir — copy it in
+                            # File saved outside session dir - copy it in
                             if fname_path.exists():
                                 dest = capture.session_dir / fname_path.name
                                 shutil.copy2(str(fname_path), str(dest))
@@ -246,7 +253,7 @@ def _redirect_path(filepath: str, session_dir: Path) -> str:
 
 
 # =============================================================================
-# SESSION SEQUENCER — Ensures ordered execution of numbered steps
+# SESSION SEQUENCER - Ensures ordered execution of numbered steps
 # =============================================================================
 
 class SessionSequencer:
@@ -418,6 +425,11 @@ class SandboxExecutor:
         safe['PermissionError'] = PermissionError
         safe['NotImplementedError'] = NotImplementedError
         safe['OverflowError'] = OverflowError
+
+        # Explicitly whitelist open() - some minimal container builtins dicts
+        # strip it, causing NameError on any file write from sandboxed code.
+        # Forcing the reference here is a no-op where it was already present.
+        safe['open'] = builtins_module.open
 
         return safe
 
@@ -629,7 +641,7 @@ class SandboxExecutor:
             alias = m.group(3)
             if alias in DEPRECATED_FREQ_ALIASES:
                 replacement = DEPRECATED_FREQ_ALIASES[alias]
-                logger.debug(f"LLM patch: freq='{alias}' → freq='{replacement}'")
+                logger.debug(f"LLM patch: freq='{alias}' -> freq='{replacement}'")
                 return f"{prefix}{quote_char}{replacement}{quote_char}"
             return m.group(0)
 
@@ -646,7 +658,7 @@ class SandboxExecutor:
             suffix = m.group(4)
             if alias in DEPRECATED_FREQ_ALIASES:
                 replacement = DEPRECATED_FREQ_ALIASES[alias]
-                logger.debug(f"LLM patch: resample('{alias}') → resample('{replacement}')")
+                logger.debug(f"LLM patch: resample('{alias}') -> resample('{replacement}')")
                 return f"{prefix}{quote_char}{replacement}{quote_char}{suffix}"
             return m.group(0)
 
@@ -663,7 +675,7 @@ class SandboxExecutor:
             suffix = m.group(4)
             if alias in DEPRECATED_FREQ_ALIASES:
                 replacement = DEPRECATED_FREQ_ALIASES[alias]
-                logger.debug(f"LLM patch: asfreq('{alias}') → asfreq('{replacement}')")
+                logger.debug(f"LLM patch: asfreq('{alias}') -> asfreq('{replacement}')")
                 return f"{prefix}{quote_char}{replacement}{quote_char}{suffix}"
             return m.group(0)
 
@@ -675,7 +687,7 @@ class SandboxExecutor:
 
         if 'urllib.request.request(' in patched:
             patched = patched.replace('urllib.request.request(', 'urllib.request.urlopen(')
-            logger.debug("LLM patch: urllib.request.request() → urllib.request.urlopen()")
+            logger.debug("LLM patch: urllib.request.request() -> urllib.request.urlopen()")
 
         return patched
 
@@ -810,30 +822,56 @@ class SandboxExecutor:
         return _normalize_path
 
     def _install_pandas_path_hooks(self, sandbox_globals: Dict, session_dir: Path):
+        global _PANDAS_ORIGINAL_READ_CSV, _PANDAS_ORIGINAL_READ_EXCEL
+
         pd_module = sandbox_globals.get('pd')
         if not pd_module:
             return
 
-        original_read_csv = pd_module.read_csv
-        original_read_excel = pd_module.read_excel
+        # Capture the TRUE originals exactly once (module-level). Previously each
+        # call treated the already-wrapped function as the "original", producing
+        # a recursion chain that grew one level per execute() call - observed up
+        # to 13 levels in production traces before this fix.
+        if _PANDAS_ORIGINAL_READ_CSV is None:
+            _PANDAS_ORIGINAL_READ_CSV = pd_module.read_csv
+        if _PANDAS_ORIGINAL_READ_EXCEL is None:
+            _PANDAS_ORIGINAL_READ_EXCEL = pd_module.read_excel
+
+        original_read_csv = _PANDAS_ORIGINAL_READ_CSV
+        original_read_excel = _PANDAS_ORIGINAL_READ_EXCEL
+
+        def _resolve_path(filepath_or_buffer):
+            """Path resolution for pandas reads with a three-step fallback:
+              1. Redirect /tmp/* (and similar) to session_dir - matches the
+                 write path so round-trips stay symmetric.
+              2. If relative, try session_dir / path.
+              3. If still not found, look for basename in session_dir. Handles
+                 the write/read asymmetry where code writes to '/tmp/foo.csv'
+                 (redirected to session_dir) then reads back via the /tmp path.
+            Non-string inputs (buffers, URLs handled by pandas) pass through.
+            """
+            if not isinstance(filepath_or_buffer, str):
+                return filepath_or_buffer
+
+            redirected = _redirect_path(filepath_or_buffer, session_dir)
+
+            if not os.path.isabs(redirected):
+                candidate = session_dir / redirected
+                if candidate.exists():
+                    return str(candidate)
+
+            if not os.path.exists(redirected):
+                fallback = session_dir / os.path.basename(redirected)
+                if fallback.exists():
+                    return str(fallback)
+
+            return redirected
 
         def _patched_read_csv(filepath_or_buffer, *args, **kwargs):
-            if isinstance(filepath_or_buffer, str):
-                filepath_or_buffer = _redirect_path(filepath_or_buffer, session_dir)
-                if not os.path.isabs(filepath_or_buffer):
-                    candidate = session_dir / filepath_or_buffer
-                    if candidate.exists():
-                        filepath_or_buffer = str(candidate)
-            return original_read_csv(filepath_or_buffer, *args, **kwargs)
+            return original_read_csv(_resolve_path(filepath_or_buffer), *args, **kwargs)
 
         def _patched_read_excel(filepath_or_buffer, *args, **kwargs):
-            if isinstance(filepath_or_buffer, str):
-                filepath_or_buffer = _redirect_path(filepath_or_buffer, session_dir)
-                if not os.path.isabs(filepath_or_buffer):
-                    candidate = session_dir / filepath_or_buffer
-                    if candidate.exists():
-                        filepath_or_buffer = str(candidate)
-            return original_read_excel(filepath_or_buffer, *args, **kwargs)
+            return original_read_excel(_resolve_path(filepath_or_buffer), *args, **kwargs)
 
         sandbox_globals['pd'].read_csv = _patched_read_csv
         sandbox_globals['pd'].read_excel = _patched_read_excel
@@ -971,7 +1009,7 @@ class SandboxExecutor:
             sandbox_globals = kernel_manager.get_or_create(
                 session_id, {}, session_dir
             )
-            logger.error(f"KERNEL_DIAG: REUSED session={session_id}, "
+            logger.debug(f"KERNEL_DIAG: REUSED session={session_id}, "
                          f"user_vars={list(kernel_manager.get_session_info(session_id)['variables'].keys())}, "
                          f"total_keys={len(sandbox_globals)}")
         else:
@@ -979,13 +1017,13 @@ class SandboxExecutor:
             sandbox_globals = kernel_manager.get_or_create(
                 session_id, sandbox_globals, session_dir
             )
-            logger.error(f"KERNEL_DIAG: CREATED session={session_id}, "
+            logger.debug(f"KERNEL_DIAG: CREATED session={session_id}, "
                          f"total_keys={len(sandbox_globals)}")
 
         sandbox_globals['__normalize_path'] = self._make_path_normalizer(session_dir)
         self._install_pandas_path_hooks(sandbox_globals, session_dir)
 
-        # ── Pre-execution syntax guard ──
+        # -- Pre-execution syntax guard --
         syntax_error = _syntax_check(code)
         if syntax_error:
             result.success = False
@@ -1009,7 +1047,7 @@ class SandboxExecutor:
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
 
-        # ── Snapshot files BEFORE execution ──
+        # -- Snapshot files BEFORE execution --
         files_before = set()
         tmp_files_before = set()
         if session_dir.exists():
@@ -1023,6 +1061,22 @@ class SandboxExecutor:
                 str(p) for p in Path('/tmp').iterdir()
                 if p.is_file() and p.suffix.lower() in STORABLE_EXTENSIONS
             )
+        except Exception:
+            pass
+
+        # Snapshot the process CWD separately so the CWD rescue diff later only
+        # picks up files genuinely created during this execution. Previously the
+        # rescue compared against files_before (which only covers session_dir),
+        # so every storable-extension file in CWD (README.md, requirements.txt,
+        # etc.) was being scooped into the session on each run.
+        cwd_files_before = set()
+        try:
+            cwd_path_pre = Path(os.getcwd())
+            if cwd_path_pre.resolve() != session_dir.resolve():
+                cwd_files_before = set(
+                    str(p) for p in cwd_path_pre.iterdir()
+                    if p.is_file() and p.suffix.lower() in STORABLE_EXTENSIONS
+                )
         except Exception:
             pass
 
@@ -1099,7 +1153,7 @@ class SandboxExecutor:
                 except Exception:
                     result.memory_used_mb = 0.0
 
-            # ── File detection: compare before/after in session_dir ──
+            # -- File detection: compare before/after in session_dir --
             new_files_from_diff = set()
             if session_dir.exists():
                 try:
@@ -1108,7 +1162,7 @@ class SandboxExecutor:
                 except Exception:
                     pass
 
-            # ── Savefig-tracked files: add any that the diff missed ──
+            # -- Savefig-tracked files: add any that the diff missed --
             savefig_files = set()
             for tracked in chart_capture._savefig_tracked:
                 tracked_path = Path(tracked)
@@ -1117,7 +1171,7 @@ class SandboxExecutor:
                 if tracked_path.exists():
                     savefig_files.add(str(tracked_path))
 
-            # ── RESCUE: Check /tmp for new storable files ──
+            # -- RESCUE: Check /tmp for new storable files --
             tmp_rescued = set()
             try:
                 tmp_files_after = set(
@@ -1140,23 +1194,31 @@ class SandboxExecutor:
             except Exception as e:
                 logger.warning(f"/tmp rescue scan failed: {e}")
 
-            # ── RESCUE: Check CWD if it differs from session_dir ──
+            # -- RESCUE: Check CWD if it differs from session_dir --
+            # Use the pre-execution cwd_files_before snapshot captured above so
+            # we only pick up files genuinely created during this execution,
+            # not pre-existing project files in CWD.
             cwd_rescued = set()
             try:
                 current_cwd = Path(os.getcwd())
                 if current_cwd.resolve() != session_dir.resolve():
-                    for f in current_cwd.iterdir():
-                        if f.is_file() and f.suffix.lower() in STORABLE_EXTENSIONS:
-                            if str(f) not in files_before:
-                                dest = session_dir / f.name
-                                if not dest.exists():
-                                    shutil.copy2(str(f), str(dest))
-                                    cwd_rescued.add(str(dest))
-                                    logger.info(f"Rescued file from CWD: {f.name} -> {dest.name}")
+                    cwd_files_after = set(
+                        str(p) for p in current_cwd.iterdir()
+                        if p.is_file() and p.suffix.lower() in STORABLE_EXTENSIONS
+                    )
+                    new_cwd_files = cwd_files_after - cwd_files_before
+                    for f_str in new_cwd_files:
+                        f = Path(f_str)
+                        if f.exists() and f.stat().st_size > 0:
+                            dest = session_dir / f.name
+                            if not dest.exists():
+                                shutil.copy2(str(f), str(dest))
+                                cwd_rescued.add(str(dest))
+                                logger.info(f"Rescued file from CWD: {f.name} -> {dest.name}")
             except Exception as e:
                 logger.warning(f"CWD rescue scan failed: {e}")
 
-            # ── Merge all detected files ──
+            # -- Merge all detected files --
             all_new_files = new_files_from_diff | savefig_files | tmp_rescued | cwd_rescued
             result.files_created = [
                 str(Path(f).relative_to(session_dir))
@@ -1175,7 +1237,7 @@ class SandboxExecutor:
                 f"{result.files_created[:5]}"
             )
 
-        # ── Store files in Postgres and build download URLs ──
+        # -- Store files in Postgres and build download URLs --
         if result.files_created:
             try:
                 download_info = await self._store_files_in_postgres(
@@ -1199,7 +1261,7 @@ class SandboxExecutor:
 
                 if non_image_downloads:
                     link_sections.append(
-                        "\n📥 **Generated files ready for download "
+                        "\n\U0001F4E5 **Generated files ready for download "
                         "(present these as clickable markdown links to the user):**"
                     )
                     for info in non_image_downloads:
@@ -1209,7 +1271,7 @@ class SandboxExecutor:
 
                 if result.inline_images:
                     link_sections.append(
-                        "\n📊 **Generated charts (embed these inline for the user):**"
+                        "\n\U0001F4CA **Generated charts (embed these inline for the user):**"
                     )
                     for img in result.inline_images:
                         link_sections.append(
