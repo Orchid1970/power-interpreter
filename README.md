@@ -8,7 +8,7 @@ Built for [SimTheory.ai](https://simtheory.ai) — execute Python code, load dat
 
 ## Version
 
-**v3.0.9** — Guardrail and runtime hardening release: the v3.0.x execution guard foundation now reflects cumulative follow-on improvements across context protection, syntax preflight, response shaping, and response budgeting. Microsoft 365 (OneDrive / SharePoint) integrations remain removed from core; this repository stays focused on a pure personal / practical sandbox for code execution, data analysis, and chart generation.
+**v3.0.9** — Executor hardening release: four independently-verified bug fixes in `app/engine/executor.py` covering pandas read-path recursion, sandbox `open()` availability, KERNEL_DIAG log severity, and CWD rescue pollution. Microsoft 365 (OneDrive / SharePoint) integrations remain removed from core; this repository stays focused on a pure personal / practical sandbox for code execution, data analysis, and chart generation.
 
 ---
 
@@ -287,7 +287,7 @@ power-interpreter/
 
 | Version | Date | Component | Changes |
 |---------|------|-----------|---------|
-| **v3.0.9** | 2026-04-19 | release, docs | Version bump to 3.0.9; README aligned to current v3.0.x guardrail foundation and cumulative release history |
+| **v3.0.9** | 2026-04-19 | executor | Fix recursion, CWD pollution, open() whitelist, KERNEL_DIAG severity (PR #9). Four independently-verified bug fixes in `app/engine/executor.py`: (1) P0 — pandas `read_csv`/`read_excel` recursion caused by `_install_pandas_path_hooks` re-wrapping already-wrapped functions on each call (observed up to 13-deep in prod); fixed via lazy one-time capture into module-level `_PANDAS_ORIGINAL_READ_{CSV,EXCEL}` globals. Read-path resolution consolidated into `_resolve_path` helper with three-step fallback (redirect → relative-to-session_dir → basename-in-session_dir). (2) P1 — `open()` explicitly whitelisted in `_get_safe_builtins()` so sandbox file writes no longer `NameError` on minimal-builtins runtimes. (3) P1 — KERNEL_DIAG REUSED/CREATED events downgraded from `logger.error` to `logger.debug` to stop polluting error dashboards. (4) P2 — CWD rescue pollution fixed by adding a separate `cwd_files_before` snapshot diffed against `cwd_files_after`, so files in the project root (README.md, requirements.txt, etc.) no longer get scooped into the session |
 | **v3.0.8** | 2026-04-18 | session, executor | feat(session): async SessionStore with TTL sweeper (PR #8). New `app/engine/session_store.py` — async-native session lifecycle coordinator with 1h TTL, lazy-started background sweeper (5-min interval), `asyncio.Lock`-serialized state; evicts expired kernels via `kernel_manager.reset_session` after releasing its own lock. `app/engine/executor.py` awaits `session_store.touch(session_id)` on entry to `execute()`. `app/version.py` bumped 3.0.7 → 3.0.8 |
 | **v3.0.7** | 2026-04-18 | logging | fix(logging): capture stderr during imports to catch FastMCP banner. Wraps all imports in a try/finally that redirects `sys.stderr` to an `io.StringIO` buffer, then re-emits captured text through `logger.info()` after `setup_logging()` neutralizes handlers. Resolves the FastMCP banner (RichHandler captured stderr at `__init__` time) being classified as ERROR severity in Railway. This is the fix v3.0.6 was supposed to ship |
 | **v3.0.6** | 2026-04-18 | version | chore(version): bump to 3.0.6 intended to ship the stderr-capture fix for the FastMCP banner. Shipped as a no-op due to a SHA race — only the version bump landed; actual code fix is in v3.0.7 |
