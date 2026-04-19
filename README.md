@@ -8,7 +8,7 @@ Built for [SimTheory.ai](https://simtheory.ai) — execute Python code, load dat
 
 ## Version
 
-**v3.0.3** — Execution guard foundation: context pressure guard, pre-execution syntax guard, response guard, and response budget. Microsoft 365 (OneDrive / SharePoint) integrations removed from core; this repository is now a pure personal / practical sandbox focused on code execution, data analysis, and chart generation.
+**v3.0.9** — Guardrail and runtime hardening release: the v3.0.x execution guard foundation now reflects cumulative follow-on improvements across context protection, syntax preflight, response shaping, and response budgeting. Microsoft 365 (OneDrive / SharePoint) integrations remain removed from core; this repository stays focused on a pure personal / practical sandbox for code execution, data analysis, and chart generation.
 
 ---
 
@@ -287,6 +287,12 @@ power-interpreter/
 
 | Version | Date | Component | Changes |
 |---------|------|-----------|---------|
+| **v3.0.9** | 2026-04-19 | release, docs | Version bump to 3.0.9; README aligned to current v3.0.x guardrail foundation and cumulative release history |
+| **v3.0.8** | 2026-04 | guards, docs | Response guard refinement and documentation polish |
+| **v3.0.7** | 2026-04 | guards | Boundary-aware response truncation hardening |
+| **v3.0.6** | 2026-04 | guards | Safe error-shape stabilization for downstream agents |
+| **v3.0.5** | 2026-04 | guards | Response budget tuning and output bounding |
+| **v3.0.4** | 2026-04 | guards | Execution guard foundation follow-on hardening and integration cleanup |
 | **v3.0.3** | 2026-04-17 | release, docs, deps | Version bump to 3.0.3; Microsoft 365 (OneDrive / SharePoint) dependencies and environment variables removed from core; README and `.env.example` aligned to personal / practical sandbox scope |
 | **v3.0.2** | 2026-04 | guards, engine | Response budget + sandbox backpressure queue |
 | **v3.0.1** | 2026-04 | guards | Pre-execution syntax guard |
