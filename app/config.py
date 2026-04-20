@@ -55,7 +55,7 @@ class Settings:
     
     # --- Sandbox Limits ---
     MAX_EXECUTION_TIME: int = int(os.getenv("MAX_EXECUTION_TIME", "300"))
-    MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", "4096"))
+    MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", "16384"))
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "500"))
     MAX_OUTPUT_SIZE: int = int(os.getenv("MAX_OUTPUT_SIZE", "1048576"))
     
