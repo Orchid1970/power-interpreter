@@ -65,7 +65,6 @@ SimTheory.ai (MCP Client)
 | `get_job_result` | Retrieve completed job output |
 | `fetch_from_url` | Download file from any HTTPS URL into sandbox |
 | `upload_file` | Upload a file via base64 encoding (<10MB) |
-| `fetch_file` | Download file from URL (legacy helper) |
 | `list_files` | List files in the sandbox |
 | `load_dataset` | Load data file into PostgreSQL — auto-detects format |
 | `query_dataset` | Execute SQL SELECT queries against loaded datasets |
@@ -95,6 +94,17 @@ All formats are loaded into PostgreSQL in 50K-row chunks with automatic indexing
 2. load_dataset(file_path="invoices.xlsx", dataset_name="invoices")
 3. query_dataset(sql="SELECT vendor, SUM(amount) FROM data_xxx GROUP BY vendor")
 ```
+
+`query_dataset` returns **columnar** JSON — column names declared once, not
+repeated per row — instead of a list of per-row dicts:
+
+```json
+{"columns":["vendor","amount"],"rows":[["Acme",1200],["Foo Inc",850]],
+ "row_count":2,"limit":1000,"offset":0,"has_more":false}
+```
+
+Match values to columns by position. This cut typical SQL result payloads by
+~40-60% (July 2026 token-efficiency pass).
 
 ---
 
@@ -217,6 +227,28 @@ This layer also works with the import resolution system (`_handle_import_line`) 
 
 ---
 
+
+## Connecting to Hermes Agent
+
+Standard MCP server. The `/mcp/sse` path handles both SSE (standard clients)
+and a direct JSON-RPC POST (used by SimTheory and Hermes). No auth on the MCP
+endpoint itself — `API_KEY` protects the underlying REST routes it wraps.
+
+```bash
+hermes mcp add power-interpreter --url "https://power-interpreter-production.up.railway.app/mcp/sse"
+hermes mcp test power-interpreter   # expect: ✓ Connected, 11 tools discovered
+```
+
+If Hermes runs in Docker (e.g. `hermes-gateway`), run inside the container:
+`docker exec -it hermes-gateway hermes mcp add power-interpreter --url "..."`.
+
+Tool changes take effect on the next fresh session (`/reset` or `/new`).
+
+## Consumers
+
+- **SimTheory.ai** — Sonnet 5.6 / GPT-5.5, via `POST /mcp/sse` JSON-RPC
+- **Hermes Agent** — via native MCP client (see above)
+
 ## Deployment
 
 Deployed on **Railway** with:
@@ -231,6 +263,7 @@ Deployed on **Railway** with:
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `API_KEY` | Yes | API key for protected endpoints |
 | `RAILWAY_PUBLIC_DOMAIN` | Auto | Set by Railway for public URLs |
+| `IMAGE_BASE64` | No (default `false`) | Set `true` to also send generated charts as base64 `ImageContent` MCP blocks, for MCP-native clients that can't render markdown image URLs (e.g. Claude Desktop). Markdown URLs in TextContent are always sent regardless. Off by default because SimTheory and Hermes both render the URLs directly, and base64 costs ~4/3 the raw image size in tokens. |
 
 ### Configuration Defaults
 
@@ -287,6 +320,7 @@ power-interpreter/
 
 | Version | Date | Component | Changes |
 |---------|------|-----------|---------|
+| **v3.1.0** | 2026-07-05 | mcp_server, data_manager | Token efficiency pass (PR #11): `query_dataset` returns columnar `{columns, rows:[[...]]}` instead of per-row dicts (~40-60% smaller); base64 chart `ImageContent` blocks moved behind `IMAGE_BASE64` env flag, **default off** (SimTheory + Hermes both render markdown image URLs already in TextContent; base64 duplicated every chart at ~4/3 the raw image size in tokens); removed `fetch_file` (exact duplicate alias of `fetch_from_url`) |
 | **v3.0.9** | 2026-04-19 | executor | Fix recursion, CWD pollution, open() whitelist, KERNEL_DIAG severity (PR #9). Four independently-verified bug fixes in `app/engine/executor.py`: (1) P0 — pandas `read_csv`/`read_excel` recursion caused by `_install_pandas_path_hooks` re-wrapping already-wrapped functions on each call (observed up to 13-deep in prod); fixed via lazy one-time capture into module-level `_PANDAS_ORIGINAL_READ_{CSV,EXCEL}` globals. Read-path resolution consolidated into `_resolve_path` helper with three-step fallback (redirect → relative-to-session_dir → basename-in-session_dir). (2) P1 — `open()` explicitly whitelisted in `_get_safe_builtins()` so sandbox file writes no longer `NameError` on minimal-builtins runtimes. (3) P1 — KERNEL_DIAG REUSED/CREATED events downgraded from `logger.error` to `logger.debug` to stop polluting error dashboards. (4) P2 — CWD rescue pollution fixed by adding a separate `cwd_files_before` snapshot diffed against `cwd_files_after`, so files in the project root (README.md, requirements.txt, etc.) no longer get scooped into the session |
 | **v3.0.8** | 2026-04-18 | session, executor | feat(session): async SessionStore with TTL sweeper (PR #8). New `app/engine/session_store.py` — async-native session lifecycle coordinator with 1h TTL, lazy-started background sweeper (5-min interval), `asyncio.Lock`-serialized state; evicts expired kernels via `kernel_manager.reset_session` after releasing its own lock. `app/engine/executor.py` awaits `session_store.touch(session_id)` on entry to `execute()`. `app/version.py` bumped 3.0.7 → 3.0.8 |
 | **v3.0.7** | 2026-04-18 | logging | fix(logging): capture stderr during imports to catch FastMCP banner. Wraps all imports in a try/finally that redirects `sys.stderr` to an `io.StringIO` buffer, then re-emits captured text through `logger.info()` after `setup_logging()` neutralizes handlers. Resolves the FastMCP banner (RichHandler captured stderr at `__init__` time) being classified as ERROR severity in Railway. This is the fix v3.0.6 was supposed to ship |
