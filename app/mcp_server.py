@@ -23,10 +23,17 @@ _ms_auth, _ms_graph = None, None
 API_BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8080")
 API_KEY = os.getenv("API_KEY", "")
 
-# Budget: max total base64 image payload per tool response (5MB)
-# Prevents SSE bloat when multiple charts are generated
-MAX_TOTAL_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
-MAX_SINGLE_IMAGE_BYTES = 5 * 1024 * 1024
+# TOKEN EFFICIENCY: base64 ImageContent blocks are OFF by default.
+# All current clients (SimTheory, Hermes) render the markdown image URLs
+# already present in TextContent; duplicating each chart as base64 cost
+# ~4/3 of the raw image size in tokens (a 200KB chart = ~67K tokens).
+# Set IMAGE_BASE64=true only for MCP-native clients that cannot render
+# markdown URLs (e.g. Claude Desktop).
+IMAGE_BASE64_ENABLED = os.getenv("IMAGE_BASE64", "false").lower() == "true"
+
+# Budget: max total base64 image payload per tool response (1MB when enabled)
+MAX_TOTAL_IMAGE_BASE64_BYTES = 1 * 1024 * 1024
+MAX_SINGLE_IMAGE_BYTES = 1 * 1024 * 1024
 
 _DL_IMAGE_URL_RE = re.compile(
     r'(https?://[^\s\)]+/dl/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([^\s\)\]]+\.(?:png|jpg|jpeg|svg|gif)))',
@@ -109,9 +116,9 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
     except (json.JSONDecodeError, TypeError):
         return blocks
 
-    inline_images = data.get('inline_images', [])
+    inline_images = data.get('inline_images', []) if IMAGE_BASE64_ENABLED else []
     download_urls = data.get('download_urls', [])
-    stdout = data.get('stdout', '')
+    stdout = data.get('stdout', '') if IMAGE_BASE64_ENABLED else ''
 
     # Separate non-image downloads from image downloads
     non_image_downloads = [d for d in download_urls if not d.get('is_image', False)]
@@ -352,18 +359,6 @@ async def upload_file(filename: str, content_base64: str, session_id: str = "def
 
 
 @mcp.tool()
-async def fetch_file(url: str, filename: str, session_id: str = "default") -> str:
-    """Download a file from a URL into the sandbox. Alias for fetch_from_url."""
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(f"{API_BASE}/api/files/fetch", headers=_headers(),
-                                     json={"url": url, "filename": filename, "session_id": session_id})
-            return resp.text
-    except Exception as e:
-        return f"fetch_file error: {e}"
-
-
-@mcp.tool()
 async def list_files(session_id: Optional[str] = "default") -> str:
     """List files in the sandbox."""
     try:
@@ -429,7 +424,11 @@ async def load_dataset(file_path: str, dataset_name: str, session_id: str = "def
 
 @mcp.tool()
 async def query_dataset(sql: str, limit: int = 1000, offset: int = 0) -> str:
-    """Execute SQL against loaded datasets."""
+    """Execute SQL against loaded datasets.
+
+    Returns columnar JSON: {"columns": [names...], "rows": [[values...], ...],
+    "row_count", "has_more"}. Match values to columns by position.
+    """
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(f"{API_BASE}/api/data/query", headers=_headers(),
