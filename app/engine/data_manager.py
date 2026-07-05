@@ -552,16 +552,19 @@ class DataManager:
             rows = result.fetchall()
             columns = list(result.keys())
 
-            data = [dict(zip(columns, row)) for row in rows]
-
-            for row in data:
-                for key, value in row.items():
-                    if isinstance(value, datetime):
-                        row[key] = value.isoformat()
+            # TOKEN EFFICIENCY: columnar rows (list of lists) instead of
+            # per-row dicts — column names are declared once in 'columns'
+            # rather than repeated on every row (~40-60% smaller payloads).
+            data = []
+            for row in rows:
+                data.append([
+                    v.isoformat() if isinstance(v, datetime) else v
+                    for v in row
+                ])
 
             return {
                 'columns': columns,
-                'data': data,
+                'rows': data,
                 'row_count': len(data),
                 'limit': limit,
                 'offset': offset,
