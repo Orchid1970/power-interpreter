@@ -8,8 +8,8 @@ A robust, sandboxed Python execution environment with:
 - MCP protocol support for SimTheory.ai
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.0.0
+Version: see app/version.py (single source of truth)
 """
 
-__version__ = "1.0.0"
+from app.version import __version__  # single source of truth
 __author__ = "Kaffer AI"

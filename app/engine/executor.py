@@ -28,6 +28,36 @@ from app.context_guard import truncate_stdout as _truncate_stdout
 
 logger = logging.getLogger(__name__)
 
+
+# Exception messages can be arbitrarily large (e.g. raise ValueError(huge_string)).
+# Uncapped, they blow past the response budget and the entire /api/execute payload
+# gets replaced by enforce_response_budget()'s wrapper dict -- which has no
+# error_message key, so MCP clients see "Unknown error". Cap at source, keeping
+# head + tail (exception messages carry their signal at the start).
+_ERROR_MESSAGE_MAX_CHARS = 4000
+
+def _cap_error_message(msg: str) -> str:
+    if len(msg) <= _ERROR_MESSAGE_MAX_CHARS:
+        return msg
+    head = msg[:_ERROR_MESSAGE_MAX_CHARS - 500]
+    tail = msg[-400:]
+    omitted = len(msg) - len(head) - len(tail)
+    return f"{head}\n... [{omitted:,} chars omitted] ...\n{tail}"
+
+
+# Tracebacks embed the exception message on their last line, so a huge message
+# makes the traceback huge too. Cap tail-first (the exception type/message and
+# nearest frames live at the END of a traceback).
+_TRACEBACK_MAX_CHARS = 20000
+
+def _cap_traceback(tb: str) -> str:
+    if len(tb) <= _TRACEBACK_MAX_CHARS:
+        return tb
+    head = tb[:1000]
+    tail = tb[-(_TRACEBACK_MAX_CHARS - 1100):]
+    omitted = len(tb) - len(head) - len(tail)
+    return f"{head}\n... [{omitted:,} chars omitted] ...\n{tail}"
+
 MIN_EXECUTION_TIMEOUT = 100
 
 # Module-level single-capture of the TRUE pandas originals. Initialised lazily
@@ -1036,8 +1066,8 @@ class SandboxExecutor:
             processed_code = self._preprocess_code(code, sandbox_globals)
         except Exception as e:
             result.success = False
-            result.error_message = f"Code preprocessing failed: {e}"
-            result.error_traceback = traceback.format_exc()
+            result.error_message = _cap_error_message(f"Code preprocessing failed: {e}")
+            result.error_traceback = _cap_traceback(traceback.format_exc())
             return result
 
         chart_capture = ChartCapture(session_dir)
@@ -1134,8 +1164,8 @@ class SandboxExecutor:
 
         except Exception as e:
             result.success = False
-            result.error_message = str(e)
-            result.error_traceback = traceback.format_exc()
+            result.error_message = _cap_error_message(str(e))
+            result.error_traceback = _cap_traceback(traceback.format_exc())
 
         finally:
             end_time = time.time()
