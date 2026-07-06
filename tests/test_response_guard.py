@@ -89,6 +89,38 @@ def test_app_wrapper_signature_detected_without_stdlib_traceback_line():
     assert "END_MARKER_XYZ" in out
 
 
+# ── v3.1.2: source-level caps in executor.py ────────────────────────
+
+def test_cap_error_message_preserves_head_and_tail():
+    from app.engine.executor import _cap_error_message
+    msg = "MARKER_HEAD_" + "x" * 99000 + "_MARKER_TAIL"
+    out = _cap_error_message(msg)
+    assert len(out) < 5000
+    assert "MARKER_HEAD_" in out
+    assert "_MARKER_TAIL" in out
+    assert "chars omitted" in out
+
+
+def test_cap_error_message_short_unchanged():
+    from app.engine.executor import _cap_error_message
+    assert _cap_error_message("boom") == "boom"
+
+
+def test_cap_traceback_keeps_tail():
+    from app.engine.executor import _cap_traceback
+    tb = "Traceback (most recent call last):\n" + "\n".join(f"  frame {i}" for i in range(5000)) + "\nValueError: THE_ANSWER"
+    out = _cap_traceback(tb)
+    assert len(out) <= 21000
+    assert "ValueError: THE_ANSWER" in out
+    assert "Traceback (most recent call last):" in out
+
+
+def test_app_version_single_source():
+    import app
+    from app.version import __version__ as v
+    assert app.__version__ == v
+
+
 def _run_as_script():
     """Fallback runner for environments without pytest installed."""
     tests = [
@@ -100,6 +132,10 @@ def _run_as_script():
         test_short_traceback_under_budget_is_unchanged,
         test_traceback_with_tiny_budget_still_returns_tail_chars,
         test_app_wrapper_signature_detected_without_stdlib_traceback_line,
+        test_cap_error_message_preserves_head_and_tail,
+        test_cap_error_message_short_unchanged,
+        test_cap_traceback_keeps_tail,
+        test_app_version_single_source,
     ]
     failures = []
     for t in tests:
