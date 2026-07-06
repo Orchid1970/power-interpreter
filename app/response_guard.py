@@ -6,7 +6,12 @@ Preserves complete JSON objects, URLs, and line boundaries.
 Strategies (tried in order):
   1. JSON array: truncate at complete object boundary
   2. JSON embedded in text: find and truncate the array portion
-  3. Line boundary: truncate at last complete line
+  3. Traceback/error tail: for text containing a Python traceback, keep
+     the END of the text (exception type + message) instead of the
+     head, since head-first truncation silently discards exactly the
+     line the caller needs to see.
+  4. Line boundary: truncate at last complete line (head-first fallback
+     for all other plain text)
 
 Version: 2.9.9
 """
@@ -73,7 +78,32 @@ def smart_truncate(text: str, max_chars: int = None) -> str:
         )
         return truncated_text + notice
 
-    # Strategy 3: Line-boundary truncation (fallback)
+    # Strategy 3: Tail-aware truncation for Python tracebacks / error blocks.
+    # Tracebacks (and this app's "Execution Error: ...\n\nTraceback:\n..."
+    # wrapper built in mcp_server.py) carry their most useful information —
+    # the exception TYPE and MESSAGE — on the LAST lines. Head-first
+    # truncation (Strategy 4 below) would keep the earliest stack frames
+    # and silently cut off exactly the line the caller needs to see (e.g.
+    # a deep-recursion traceback ending in "RecursionError: ..."). Detect
+    # this case and keep the tail instead.
+    if _looks_like_traceback(text):
+        truncated = _truncate_traceback_tail(text, budget)
+        total_lines = text.count('\n') + 1
+        kept_lines = truncated.count('\n') + 1
+        logger.info(
+            f"Smart truncate: traceback tail ~{kept_lines}/{total_lines} lines "
+            f"({original_len:,} -> {len(truncated):,} chars)"
+        )
+        notice = (
+            f"\n\n⚠️ TRUNCATED: Showing END of traceback/error "
+            f"(~{kept_lines} of ~{total_lines} lines) — earliest frames "
+            f"omitted, exception type/message preserved "
+            f"(response budget: {max_chars:,} chars, "
+            f"original: {original_len:,} chars)."
+        )
+        return truncated + notice
+
+    # Strategy 4: Line-boundary truncation (fallback, head-first)
     truncated = _truncate_at_line_boundary(text, budget)
     total_lines = text.count('\n') + 1
     kept_lines = truncated.count('\n') + 1
@@ -205,6 +235,84 @@ def _fit_items_in_budget(items: list, budget: int):
         running += needed
 
     return kept if kept else None
+
+
+# Signatures that indicate text contains a Python traceback (or this app's
+# "Execution Error: ...\n\nTraceback:\n..." wrapper) where the crucial
+# exception TYPE and MESSAGE live at the END of the text, not the start.
+_TRACEBACK_SIGNATURES = (
+    "Traceback (most recent call last):",
+    "\n\nTraceback:\n",
+)
+
+
+def _looks_like_traceback(text: str) -> bool:
+    """Detect whether text contains a Python traceback / error block whose
+    most useful content (the exception type + message) is on its last
+    lines rather than its first lines.
+    """
+    return any(sig in text for sig in _TRACEBACK_SIGNATURES)
+
+
+def _truncate_traceback_tail(text: str, budget: int) -> str:
+    """Truncate traceback/error text by keeping the TAIL, not the head.
+
+    Python tracebacks -- and this app's "Execution Error: ...\\n\\nTraceback:
+    ..." wrapper built in mcp_server.py -- carry their most useful
+    information (the exception TYPE and MESSAGE, e.g. "ValueError: invalid
+    literal...") on the LAST lines. A plain head-first truncation would
+    keep the earliest stack frames and silently cut off exactly the line
+    the caller needs to see.
+
+    Strategy:
+      1. Keep a short "head anchor" (first line only) when it's small
+         relative to the budget -- this is usually the app's
+         "Execution Error: <message>" summary line, and is cheap, useful
+         context for *what* failed.
+      2. Fill the rest of the budget from the END of the text, walking
+         backwards a whole line at a time so a line is never cut mid-way.
+      3. If even the single last line doesn't fit the budget (e.g. one
+         extremely long line), hard-cut the last `budget` characters as a
+         last resort so the tail still survives.
+    """
+    if budget >= len(text):
+        return text
+    if budget <= 0:
+        return ""
+
+    lines = text.split('\n')
+
+    # Reserve a small slice of the budget for a head anchor (first line)
+    # so the reader still sees *what* failed, not just the raw traceback.
+    head_anchor = ""
+    tail_budget = budget
+    if lines and len(lines[0]) <= max(budget * 0.2, 40):
+        head_anchor = lines[0]
+        tail_budget = budget - len(head_anchor) - len("\n...\n")
+        if tail_budget <= 0:
+            head_anchor = ""
+            tail_budget = budget
+
+    tail_lines = []
+    running = 0
+    for line in reversed(lines):
+        separator = 1 if tail_lines else 0  # '\n' joining this line to kept tail
+        needed = len(line) + separator
+        if running + needed > tail_budget:
+            break
+        tail_lines.insert(0, line)
+        running += needed
+
+    if not tail_lines:
+        # Not even the last line fits — hard character cut from the end
+        # so we still surface *something* of the exception message.
+        return text[-budget:]
+
+    tail_text = '\n'.join(tail_lines)
+
+    if head_anchor and len(tail_lines) < len(lines):
+        return f"{head_anchor}\n...\n{tail_text}"
+    return tail_text
 
 
 def _truncate_at_line_boundary(text: str, budget: int) -> str:
